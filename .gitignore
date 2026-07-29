@@ -16,3 +16,6 @@ entitlements.codesign.xml
 /Compare
 /.rule/
 /sample/
+/.angle-src
+/.derived-data-sim/
+/scripts/__pycache__/

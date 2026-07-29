@@ -1,0 +1,797 @@
+From c6f8f563c201093ff0d009d7efcb2114113462c6 Mon Sep 17 00:00:00 2001
+From: Amethyst Contributors <amethyst@example.invalid>
+Date: Wed, 29 Jul 2026 16:40:47 +0900
+Subject: [PATCH 5/6] Metal: implement Desktop GL texture buffers
+
+---
+ src/libANGLE/Context.cpp                     |  14 +-
+ src/libANGLE/State.cpp                       |   4 +-
+ src/libANGLE/Texture.cpp                     |  10 +-
+ src/libANGLE/Texture.h                       |   1 +
+ src/libANGLE/queryutils.cpp                  |   4 +-
+ src/libANGLE/renderer/metal/BufferMtl.h      |   7 +
+ src/libANGLE/renderer/metal/BufferMtl.mm     |  49 +++++
+ src/libANGLE/renderer/metal/DisplayMtl.mm    |  24 ++-
+ src/libANGLE/renderer/metal/TextureMtl.h     |  15 ++
+ src/libANGLE/renderer/metal/TextureMtl.mm    | 198 ++++++++++++++++++-
+ src/libANGLE/renderer/metal/mtl_resources.h  |   8 +
+ src/libANGLE/renderer/metal/mtl_resources.mm |  39 ++++
+ src/libANGLE/validationES32.cpp              |  10 +-
+ src/tests/gl_tests/DesktopGLSLTest.cpp       |  64 ++++++
+ src/tests/test_utils/angle_test_configs.cpp  |   6 +
+ src/tests/test_utils/angle_test_configs.h    |   1 +
+ 16 files changed, 439 insertions(+), 15 deletions(-)
+
+diff --git a/src/libANGLE/Context.cpp b/src/libANGLE/Context.cpp
+index c147c5f40..733ac11b1 100644
+--- a/src/libANGLE/Context.cpp
++++ b/src/libANGLE/Context.cpp
+@@ -744,7 +744,8 @@ void Context::initializeDefaultResources()
+         mZeroTextures[TextureType::CubeMapArray].set(this, zeroTextureCubeMapArray);
+     }
+ 
+-    if ((getClientType() != EGL_OPENGL_API && getClientVersion() >= Version(3, 2)) ||
++    if ((getClientType() == EGL_OPENGL_API && getClientVersion() >= Version(3, 1)) ||
++        (getClientType() != EGL_OPENGL_API && getClientVersion() >= Version(3, 2)) ||
+         mSupportedExtensions.textureBufferAny())
+     {
+         Texture *zeroTextureBuffer = new Texture(mImplementation.get(), {0}, TextureType::Buffer);
+@@ -4503,7 +4504,9 @@ void Context::updateCaps()
+         mValidBufferBindings.set(BufferBinding::DispatchIndirect);
+     }
+ 
+-    if (getClientVersion() >= ES_3_2 || mState.getExtensions().textureBufferAny())
++    if ((getClientType() == EGL_OPENGL_API && getClientVersion() >= Version(3, 1)) ||
++        (getClientType() != EGL_OPENGL_API && getClientVersion() >= ES_3_2) ||
++        mState.getExtensions().textureBufferAny())
+     {
+         mValidBufferBindings.set(BufferBinding::Texture);
+     }
+@@ -10543,6 +10546,11 @@ void StateCache::updateValidBindTextureTypes(Context *context)
+     const Extensions &exts = context->getExtensions();
+     bool isGLES3           = context->getClientMajorVersion() >= 3;
+     bool isGLES31          = context->getClientVersion() >= Version(3, 1);
++    bool supportsTextureBuffer =
++        (context->getClientType() == EGL_OPENGL_API && isGLES31) ||
++        (context->getClientType() != EGL_OPENGL_API &&
++         context->getClientVersion() >= Version(3, 2)) ||
++        exts.textureBufferAny();
+ 
+     mCachedValidBindTextureTypes = {{
+         {TextureType::_2D, true},
+@@ -10555,7 +10563,7 @@ void StateCache::updateValidBindTextureTypes(Context *context)
+         {TextureType::CubeMap, true},
+         {TextureType::CubeMapArray, exts.textureCubeMapArrayAny()},
+         {TextureType::VideoImage, exts.videoTextureWEBGL},
+-        {TextureType::Buffer, exts.textureBufferAny()},
++        {TextureType::Buffer, supportsTextureBuffer},
+     }};
+ }
+ 
+diff --git a/src/libANGLE/State.cpp b/src/libANGLE/State.cpp
+index b2414c917..9fce08f86 100644
+--- a/src/libANGLE/State.cpp
++++ b/src/libANGLE/State.cpp
+@@ -2296,7 +2296,9 @@ void State::initialize(Context *context)
+     {
+         mSamplerTextures[TextureType::CubeMapArray].resize(getCaps().maxCombinedTextureImageUnits);
+     }
+-    if (clientVersion >= Version(3, 1) || nativeExtensions.textureCubeMapArrayAny())
++    if ((context->getClientType() == EGL_OPENGL_API && clientVersion >= Version(3, 1)) ||
++        (context->getClientType() != EGL_OPENGL_API && clientVersion >= Version(3, 2)) ||
++        nativeExtensions.textureBufferAny())
+     {
+         mSamplerTextures[TextureType::Buffer].resize(getCaps().maxCombinedTextureImageUnits);
+     }
+diff --git a/src/libANGLE/Texture.cpp b/src/libANGLE/Texture.cpp
+index fbde36330..5a1c05471 100644
+--- a/src/libANGLE/Texture.cpp
++++ b/src/libANGLE/Texture.cpp
+@@ -2276,7 +2276,11 @@ angle::Result Texture::setBufferRange(const gl::Context *context,
+     mState.mImmutableLevels           = static_cast<GLuint>(1);
+     InternalFormat internalFormatInfo = GetSizedInternalFormatInfo(internalFormat);
+     Format format(internalFormat);
+-    Extents extents(static_cast<GLuint>(size / internalFormatInfo.pixelBytes), 1, 1);
++    mTextureBufferMaxSize = static_cast<GLuint>(context->getCaps().maxTextureBufferSize);
++    const size_t textureWidth =
++        std::min(static_cast<size_t>(size / internalFormatInfo.pixelBytes),
++                 static_cast<size_t>(mTextureBufferMaxSize));
++    Extents extents(static_cast<GLuint>(textureWidth), 1, 1);
+     InitState initState = buffer->initState();
+     mState.setImageDesc(TextureTarget::Buffer, 0, ImageDesc(extents, format, initState));
+ 
+@@ -2553,7 +2557,9 @@ void Texture::onSubjectStateChange(angle::SubjectIndex index, angle::SubjectMess
+ 
+                 ImageDesc desc          = mState.getImageDesc(TextureTarget::Buffer, 0);
+                 const GLuint pixelBytes = desc.format.info->pixelBytes;
+-                desc.size.width         = static_cast<GLuint>(size / pixelBytes);
++                desc.size.width = static_cast<GLuint>(
++                    std::min(static_cast<size_t>(size / pixelBytes),
++                             static_cast<size_t>(mTextureBufferMaxSize)));
+ 
+                 mState.setImageDesc(TextureTarget::Buffer, 0, desc);
+             }
+diff --git a/src/libANGLE/Texture.h b/src/libANGLE/Texture.h
+index 43399b747..a6aad8ece 100644
+--- a/src/libANGLE/Texture.h
++++ b/src/libANGLE/Texture.h
+@@ -774,6 +774,7 @@ class Texture final : public RefCountObject<TextureID>,
+     angle::ObserverBinding mImplObserver;
+     // For EXT_texture_buffer, observes buffer changes.
+     angle::ObserverBinding mBufferObserver;
++    GLuint mTextureBufferMaxSize = 0;
+ 
+     egl::Surface *mBoundSurface;
+     egl::Stream *mBoundStream;
+diff --git a/src/libANGLE/queryutils.cpp b/src/libANGLE/queryutils.cpp
+index 381318ba2..5aff26cae 100644
+--- a/src/libANGLE/queryutils.cpp
++++ b/src/libANGLE/queryutils.cpp
+@@ -4060,7 +4060,9 @@ bool GetQueryParameterInfo(const State &glState,
+         }
+     }
+ 
+-    if (extensions.textureBufferAny())
++    if ((clientType == EGL_OPENGL_API && glState.getClientVersion() >= Version(3, 1)) ||
++        (clientType != EGL_OPENGL_API && glState.getClientVersion() >= Version(3, 2)) ||
++        extensions.textureBufferAny())
+     {
+         switch (pname)
+         {
+diff --git a/src/libANGLE/renderer/metal/BufferMtl.h b/src/libANGLE/renderer/metal/BufferMtl.h
+index 8162f1033..284d1350e 100644
+--- a/src/libANGLE/renderer/metal/BufferMtl.h
++++ b/src/libANGLE/renderer/metal/BufferMtl.h
+@@ -159,6 +159,10 @@ class BufferMtl : public BufferImpl, public BufferHolderMtl
+     const uint8_t *getBufferDataReadOnly(ContextMtl *contextMtl);
+     bool isSafeToReadFromBufferViaBlit(ContextMtl *contextMtl);
+ 
++    // A Metal buffer-backed texture includes bytesPerRow padding in its required allocation.
++    // This padding is deliberately kept outside the logical GL buffer size.
++    angle::Result ensureTextureBufferCompatible(ContextMtl *contextMtl, size_t requiredSize);
++
+     ConversionBufferMtl *getVertexConversionBuffer(ContextMtl *context,
+                                                    angle::FormatID formatID,
+                                                    GLuint stride,
+@@ -247,6 +251,9 @@ class BufferMtl : public BufferImpl, public BufferHolderMtl
+     std::optional<RestartRangeCache> mRestartRangeCache;
+     std::vector<IndexRange> mRestartIndices;
+     size_t mGLSize        = 0;  // size GL asked for (vs size we actually allocated)
++    // Once this buffer backs a Metal texture, preserve enough physical padding across orphaning
++    // and buffer rotation. This does not change the logical GL buffer size.
++    size_t mTextureBufferMinAllocationSize = 0;
+     size_t mRevisionCount = 0;  // for generating labels only
+     gl::BufferUsage mUsage;
+ };
+diff --git a/src/libANGLE/renderer/metal/BufferMtl.mm b/src/libANGLE/renderer/metal/BufferMtl.mm
+index 398e6d3e3..ac04ac25c 100644
+--- a/src/libANGLE/renderer/metal/BufferMtl.mm
++++ b/src/libANGLE/renderer/metal/BufferMtl.mm
+@@ -106,6 +106,7 @@ bool isOffsetAndSizeMetalBlitCompatible(size_t offset, size_t size)
+ {
+     ContextMtl *contextMtl = mtl::GetImpl(context);
+     mShadowCopy.clear();
++    mTextureBufferMinAllocationSize = 0;
+ 
+     // if there's a buffer, give it back to the buffer manager
+     if (mBuffer)
+@@ -509,6 +510,8 @@ bool isOffsetAndSizeMetalBlitCompatible(size_t offset, size_t size)
+                                                 size_t size,
+                                                 bool returnOldBufferImmediately)
+ {
++    size = std::max(size, mTextureBufferMinAllocationSize);
++
+     mtl::BufferManager &bufferManager = contextMtl->getBufferManager();
+     if (returnOldBufferImmediately && mBuffer)
+     {
+@@ -617,6 +620,52 @@ bool isOffsetAndSizeMetalBlitCompatible(size_t offset, size_t size)
+     return !isSameSerial;
+ }
+ 
++angle::Result BufferMtl::ensureTextureBufferCompatible(ContextMtl *contextMtl,
++                                                       size_t requiredSize)
++{
++    mTextureBufferMinAllocationSize =
++        std::max(mTextureBufferMinAllocationSize, requiredSize);
++
++    if (mBuffer && mBuffer->size() >= requiredSize)
++    {
++        return angle::Result::Continue;
++    }
++
++    mtl::BufferRef oldBuffer = mBuffer;
++    const MTLStorageMode storageMode =
++        oldBuffer ? oldBuffer->storageMode()
++                  : mtl::Buffer::getStorageModeForUsage(contextMtl, mUsage);
++
++    ANGLE_TRY(allocateNewMetalBuffer(contextMtl, storageMode, std::max<size_t>(1, requiredSize),
++                                     /*returnOldBufferImmediately=*/false));
++
++    const size_t copySize =
++        oldBuffer ? std::min(static_cast<size_t>(mGLSize), oldBuffer->size()) : 0;
++    if (copySize != 0)
++    {
++        if (isOffsetAndSizeMetalBlitCompatible(0, copySize))
++        {
++            mtl::BlitCommandEncoder *blitEncoder = contextMtl->getBlitCommandEncoder();
++            blitEncoder->copyBuffer(oldBuffer, 0, mBuffer, 0, copySize);
++        }
++        else
++        {
++            const uint8_t *source = oldBuffer->mapReadOnly(contextMtl);
++            uint8_t *destination  = mBuffer->mapWithOpt(contextMtl, false, true);
++            std::copy(source, source + copySize, destination);
++            oldBuffer->unmapNoFlush(contextMtl);
++            mBuffer->unmapAndFlushSubset(contextMtl, 0, copySize);
++        }
++    }
++
++    if (oldBuffer)
++    {
++        contextMtl->getBufferManager().returnBuffer(contextMtl, oldBuffer);
++    }
++
++    return angle::Result::Continue;
++}
++
+ angle::Result BufferMtl::updateExistingBufferViaBlitFromStagingBuffer(ContextMtl *contextMtl,
+                                                                       const uint8_t *srcPtr,
+                                                                       size_t sizeToCopy,
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 91eb3cff1..b12d724bb 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -857,6 +857,26 @@ bool IsMetalDisplayAvailable()
+     mNativeCaps.minProgramTexelOffset = -8;
+     mNativeCaps.maxProgramTexelOffset = 7;
+ 
++    // Metal texture buffers are views over MTLBuffer storage. Use the largest core texture-buffer
++    // texel size (RGBA32 = 16 bytes) so the advertised texel count is valid for every format.
++    const NSUInteger maxMetalTextureBufferWidth =
++        supportsAppleGPUFamily(3) ? 256u * 1024u * 1024u : 64u * 1024u * 1024u;
++    mNativeCaps.maxTextureBufferSize = static_cast<GLint>(
++        std::min(maxMetalTextureBufferWidth, [mMetalDevice maxBufferLength] / 16u));
++
++    NSUInteger textureBufferAlignment = 256;
++    for (MTLPixelFormat pixelFormat :
++         {MTLPixelFormatR8Unorm, MTLPixelFormatR16Float, MTLPixelFormatR32Float,
++          MTLPixelFormatRG8Unorm, MTLPixelFormatRG16Float, MTLPixelFormatRG32Float,
++          MTLPixelFormatRGBA8Unorm, MTLPixelFormatRGBA16Float, MTLPixelFormatRGBA32Float})
++    {
++        textureBufferAlignment =
++            std::max(textureBufferAlignment,
++                     [mMetalDevice minimumTextureBufferAlignmentForPixelFormat:pixelFormat]);
++    }
++    mNativeCaps.textureBufferOffsetAlignment =
++        static_cast<GLint>(textureBufferAlignment);
++
+     // NOTE(hqle): support storage buffer.
+     const uint32_t maxPerStageStorageBuffers                     = 0;
+     mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Vertex]   = maxPerStageStorageBuffers;
+@@ -938,7 +958,9 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.stencilTexturingANGLE         = true;
+     mNativeExtensions.copyTextureCHROMIUM           = true;
+     mNativeExtensions.copyCompressedTextureCHROMIUM = false;
+-    mNativeExtensions.getImageANGLE                 = true;
++    // TextureMtl does not implement the complete uncompressed/compressed get-image contract.
++    // Do not advertise an extension that would dispatch into TextureImpl::UNREACHABLE.
++    mNativeExtensions.getImageANGLE                 = false;
+     mNativeExtensions.shaderNonConstantGlobalInitializersEXT = true;
+     mNativeExtensions.textureMirrorClampToEdgeEXT   = true;
+     mNativeExtensions.depthClampEXT                 = true;
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.h b/src/libANGLE/renderer/metal/TextureMtl.h
+index 8787ad79e..1849db335 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.h
++++ b/src/libANGLE/renderer/metal/TextureMtl.h
+@@ -113,6 +113,8 @@ class TextureMtl : public TextureImpl
+                              GLenum internalFormat,
+                              const gl::Extents &size) override;
+ 
++    angle::Result setBuffer(const gl::Context *context, GLenum internalFormat) override;
++
+     angle::Result setStorageExternalMemory(const gl::Context *context,
+                                            gl::TextureType type,
+                                            size_t levels,
+@@ -186,6 +188,7 @@ class TextureMtl : public TextureImpl
+ 
+   private:
+     void deallocateNativeStorage(bool keepImages, bool keepSamplerStateAndFormat = false);
++    angle::Result ensureBufferTextureCreated(const gl::Context *context);
+     angle::Result createNativeStorage(const gl::Context *context,
+                                       gl::TextureType type,
+                                       GLuint mips,
+@@ -369,6 +372,18 @@ class TextureMtl : public TextureImpl
+ 
+     // The swizzled or stencil view used for shader sampling.
+     mtl::TextureRef mSwizzleStencilSamplingView;
++
++    GLenum mBufferInternalFormat = GL_NONE;
++    // Keep the backing buffer alive and detect BufferMtl reallocations. The mtl::Texture also
++    // shares this resource's usage tracking so the buffer manager cannot recycle it too early.
++    mtl::BufferRef mBufferTextureBacking;
++    // The iOS Simulator only permits linear texture views over private Metal buffers. Keep a
++    // private GPU copy separate from the GL buffer, which must remain CPU-accessible for mapping.
++    mtl::BufferRef mBufferTexturePrivateBacking;
++    bool mBufferTextureContentsDirty = true;
++    size_t mBufferTextureOffset      = 0;
++    size_t mBufferTextureBytesPerRow = 0;
++    uint32_t mBufferTextureWidth     = 0;
+ };
+ 
+ }  // namespace rx
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 841a5a0dd..9ad9b6f91 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -12,6 +12,7 @@
+ 
+ #include <algorithm>
+ #include <initializer_list>
++#include <limits>
+ 
+ #include "common/Color.h"
+ #include "common/MemoryBuffer.h"
+@@ -918,9 +919,15 @@ uint32_t height(GLuint glLevel) const
+         retainImageDefinitions();
+     }
+ 
+-    mNativeTextureStorage       = nullptr;
+-    mViewFromBaseToMaxLevel     = nullptr;
+-    mSwizzleStencilSamplingView = nullptr;
++    mNativeTextureStorage        = nullptr;
++    mViewFromBaseToMaxLevel      = nullptr;
++    mSwizzleStencilSamplingView  = nullptr;
++    mBufferTextureBacking        = nullptr;
++    mBufferTexturePrivateBacking = nullptr;
++    mBufferTextureContentsDirty  = true;
++    mBufferTextureOffset         = 0;
++    mBufferTextureBytesPerRow    = 0;
++    mBufferTextureWidth          = 0;
+ 
+     // Clear render target cache for each texture's image. We don't erase them because they
+     // might still be referenced by a framebuffer.
+@@ -952,8 +959,150 @@ uint32_t height(GLuint glLevel) const
+     }
+ }
+ 
++angle::Result TextureMtl::ensureBufferTextureCreated(const gl::Context *context)
++{
++    ASSERT(mState.getType() == gl::TextureType::Buffer);
++
++    ContextMtl *contextMtl                                    = mtl::GetImpl(context);
++    const gl::OffsetBindingPointer<gl::Buffer> &bufferBinding = mState.getBuffer();
++    gl::Buffer *buffer                                        = bufferBinding.get();
++    if (!buffer)
++    {
++        if (mNativeTextureStorage)
++        {
++            deallocateNativeStorage(/*keepImages=*/false);
++            contextMtl->invalidateCurrentTextures();
++        }
++        return angle::Result::Continue;
++    }
++
++    BufferMtl *bufferMtl       = mtl::GetImpl(buffer);
++    mtl::BufferRef metalBuffer = bufferMtl->getCurrentBuffer();
++
++    const GLintptr bindingOffset = bufferBinding.getOffset();
++    const GLsizeiptr bindingSize = gl::GetBoundBufferAvailableSize(bufferBinding);
++    ANGLE_MTL_CHECK(contextMtl, bindingOffset >= 0 && bindingSize >= 0, GL_INVALID_VALUE);
++
++    const gl::InternalFormat &internalFormatInfo =
++        gl::GetSizedInternalFormatInfo(mBufferInternalFormat);
++    const size_t intendedPixelBytes = internalFormatInfo.pixelBytes;
++    ANGLE_MTL_CHECK(contextMtl, intendedPixelBytes != 0, GL_INVALID_ENUM);
++
++    const size_t logicalWidth = static_cast<size_t>(bindingSize) / intendedPixelBytes;
++    const size_t clampedWidth = std::min(
++        logicalWidth, static_cast<size_t>(std::max(context->getCaps().maxTextureBufferSize, 0)));
++    const uint32_t width = static_cast<uint32_t>(clampedWidth);
++    if (width == 0)
++    {
++        if (mNativeTextureStorage)
++        {
++            deallocateNativeStorage(/*keepImages=*/false);
++            contextMtl->invalidateCurrentTextures();
++        }
++        return angle::Result::Continue;
++    }
++    const angle::FormatID angleFormatID = angle::Format::InternalFormatToID(mBufferInternalFormat);
++    const mtl::Format &format           = contextMtl->getPixelFormat(angleFormatID);
++    ANGLE_MTL_CHECK(contextMtl, format.valid(), GL_INVALID_OPERATION);
++
++    // A raw Metal texture view cannot represent formats whose texel layout ANGLE emulates
++    // (notably three-component formats). Do not silently change the GL element stride.
++    ANGLE_MTL_CHECK(contextMtl, format.intendedFormatId == format.actualFormatId,
++                    GL_INVALID_OPERATION);
++    const size_t actualPixelBytes = format.actualAngleFormat().pixelBytes;
++    ANGLE_MTL_CHECK(contextMtl, actualPixelBytes == intendedPixelBytes, GL_INVALID_OPERATION);
++
++    const NSUInteger alignment = [contextMtl->getMetalDevice().get()
++        minimumTextureBufferAlignmentForPixelFormat:format.metalFormat];
++    ANGLE_MTL_CHECK(contextMtl, alignment != 0, GL_INVALID_OPERATION);
++
++    const size_t unalignedBytesPerRow = static_cast<size_t>(width) * actualPixelBytes;
++    ANGLE_MTL_CHECK(contextMtl,
++                    unalignedBytesPerRow <=
++                        std::numeric_limits<size_t>::max() - (static_cast<size_t>(alignment) - 1),
++                    GL_OUT_OF_MEMORY);
++    const size_t bytesPerRow = roundUp(unalignedBytesPerRow, static_cast<size_t>(alignment));
++    ANGLE_MTL_CHECK(contextMtl,
++                    static_cast<size_t>(bindingOffset) <=
++                        std::numeric_limits<size_t>::max() - static_cast<size_t>(bytesPerRow),
++                    GL_OUT_OF_MEMORY);
++    const size_t requiredBufferSize = static_cast<size_t>(bindingOffset) + bytesPerRow;
++
++    ANGLE_TRY(bufferMtl->ensureTextureBufferCompatible(contextMtl, requiredBufferSize));
++    metalBuffer = bufferMtl->getCurrentBuffer();
++
++    const bool cachedViewMatches = mNativeTextureStorage && metalBuffer == mBufferTextureBacking &&
++                                   mBufferTextureOffset == static_cast<size_t>(bindingOffset) &&
++                                   mBufferTextureBytesPerRow == bytesPerRow &&
++                                   mBufferTextureWidth == width && mFormat == format;
++
++#if TARGET_OS_SIMULATOR
++    // MTLSimBuffer rejects linear texture views over shared storage. The GL buffer itself cannot
++    // simply become private because BufferMtl exposes it to map/glBufferSubData. Mirror it into a
++    // private GPU buffer and preserve command ordering with a blit instead.
++    const bool requiresPrivateBacking = metalBuffer->storageMode() != MTLStorageModePrivate;
++#else
++    constexpr bool requiresPrivateBacking = false;
++#endif
++
++    if (cachedViewMatches)
++    {
++        if (requiresPrivateBacking && mBufferTextureContentsDirty)
++        {
++            ANGLE_MTL_CHECK(contextMtl,
++                            mBufferTexturePrivateBacking &&
++                                mBufferTexturePrivateBacking->size() >= requiredBufferSize,
++                            GL_OUT_OF_MEMORY);
++            mtl::BlitCommandEncoder *blitEncoder = contextMtl->getBlitCommandEncoder();
++            blitEncoder->copyBuffer(metalBuffer, 0, mBufferTexturePrivateBacking, 0,
++                                    requiredBufferSize);
++        }
++        mBufferTextureContentsDirty = false;
++        return angle::Result::Continue;
++    }
++
++    deallocateNativeStorage(/*keepImages=*/false);
++    mFormat                   = format;
++    mBufferTextureBacking     = metalBuffer;
++    mBufferTextureOffset      = static_cast<size_t>(bindingOffset);
++    mBufferTextureBytesPerRow = bytesPerRow;
++    mBufferTextureWidth       = width;
++
++    mtl::BufferRef textureViewBuffer = metalBuffer;
++    if (requiresPrivateBacking)
++    {
++        ANGLE_TRY(mtl::Buffer::MakeBufferWithStorageMode(contextMtl, MTLStorageModePrivate,
++                                                         requiredBufferSize, nullptr,
++                                                         &mBufferTexturePrivateBacking));
++        mtl::BlitCommandEncoder *blitEncoder = contextMtl->getBlitCommandEncoder();
++        blitEncoder->copyBuffer(metalBuffer, 0, mBufferTexturePrivateBacking, 0,
++                                requiredBufferSize);
++        textureViewBuffer = mBufferTexturePrivateBacking;
++    }
++
++    mtl::TextureRef nativeTexture;
++    ANGLE_TRY(mtl::Texture::MakeBufferTexture(contextMtl, textureViewBuffer, mFormat, width,
++                                              static_cast<size_t>(bindingOffset), bytesPerRow,
++                                              &nativeTexture));
++
++    mNativeTextureStorage =
++        std::make_unique<NativeTextureWrapperWithViewSupport>(nativeTexture, /*baseGLLevel=*/0);
++    mViewFromBaseToMaxLevel =
++        std::make_unique<NativeTextureWrapper>(std::move(nativeTexture), /*baseGLLevel=*/0);
++    ANGLE_TRY(ensureSamplerStateCreated(context));
++    contextMtl->invalidateCurrentTextures();
++    mBufferTextureContentsDirty = false;
++
++    return angle::Result::Continue;
++}
++
+ angle::Result TextureMtl::ensureNativeStorageCreated(const gl::Context *context)
+ {
++    if (mState.getType() == gl::TextureType::Buffer)
++    {
++        return ensureBufferTextureCreated(context);
++    }
++
+     if (mNativeTextureStorage)
+     {
+         return angle::Result::Continue;
+@@ -1572,6 +1721,14 @@ uint32_t height(GLuint glLevel) const
+     return setStorageImpl(context, type, mipmaps, mtlFormat, size);
+ }
+ 
++angle::Result TextureMtl::setBuffer(const gl::Context *context, GLenum internalFormat)
++{
++    deallocateNativeStorage(/*keepImages=*/false);
++    mBufferInternalFormat = internalFormat;
++    mtl::GetImpl(context)->invalidateCurrentTextures();
++    return angle::Result::Continue;
++}
++
+ angle::Result TextureMtl::setStorageExternalMemory(const gl::Context *context,
+                                                    gl::TextureType type,
+                                                    size_t levels,
+@@ -1836,6 +1993,15 @@ uint32_t height(GLuint glLevel) const
+                                     const gl::Texture::DirtyBits &dirtyBits,
+                                     gl::Command source)
+ {
++    if (mState.getType() == gl::TextureType::Buffer)
++    {
++        if (dirtyBits.test(gl::Texture::DIRTY_BIT_IMPLEMENTATION))
++        {
++            mBufferTextureContentsDirty = true;
++        }
++        return ensureBufferTextureCreated(context);
++    }
++
+     ContextMtl *contextMtl = mtl::GetImpl(context);
+     for (size_t dirtyBit : dirtyBits)
+     {
+@@ -1893,6 +2059,28 @@ uint32_t height(GLuint glLevel) const
+                                        int textureSlotIndex,
+                                        int samplerSlotIndex)
+ {
++    if (mState.getType() == gl::TextureType::Buffer)
++    {
++        const mtl::TextureRef nativeTexture =
++            mNativeTextureStorage ? mNativeTextureStorage->getNativeTexture() : mtl::TextureRef();
++
++        float minLodClamp                = mState.getSamplerState().getMinLod();
++        float maxLodClamp                = mState.getSamplerState().getMaxLod();
++        id<MTLSamplerState> samplerState = mMetalSamplerState;
++        if (sampler)
++        {
++            SamplerMtl *samplerMtl = mtl::GetImpl(sampler);
++            samplerState           = samplerMtl->getSampler(mtl::GetImpl(context));
++            minLodClamp            = sampler->getSamplerState().getMinLod();
++            maxLodClamp            = sampler->getSamplerState().getMaxLod();
++        }
++
++        cmdEncoder->setTexture(shaderType, nativeTexture, textureSlotIndex);
++        cmdEncoder->setSamplerState(shaderType, samplerState, std::max(minLodClamp, 0.0f),
++                                    maxLodClamp, samplerSlotIndex);
++        return angle::Result::Continue;
++    }
++
+     ASSERT(mNativeTextureStorage);
+     ASSERT(mViewFromBaseToMaxLevel);
+ 
+@@ -1934,12 +2122,12 @@ uint32_t height(GLuint glLevel) const
+                 {
+                     format = MTLPixelFormatX32_Stencil8;
+                 }
+-#    if TARGET_OS_OSX || TARGET_OS_MACCATALYST
++#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+                 else if (format == MTLPixelFormatDepth24Unorm_Stencil8)
+                 {
+                     format = MTLPixelFormatX24_Stencil8;
+                 }
+-#    endif
++#endif
+             }
+ 
+             mSwizzleStencilSamplingView = mNativeTextureStorage->createMipsSwizzleView(
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.h b/src/libANGLE/renderer/metal/mtl_resources.h
+index 051259c2c..34f2b8c1b 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.h
++++ b/src/libANGLE/renderer/metal/mtl_resources.h
+@@ -189,6 +189,13 @@ class Texture final : public Resource,
+                                        bool renderTargetOnly,
+                                        bool allowFormatView,
+                                        TextureRef *refOut);
++    static angle::Result MakeBufferTexture(ContextMtl *context,
++                                           const BufferRef &buffer,
++                                           const Format &format,
++                                           uint32_t width,
++                                           size_t offset,
++                                           size_t bytesPerRow,
++                                           TextureRef *refOut);
+     static TextureRef MakeFromMetal(id<MTLTexture> metalTexture);
+ 
+     // Allow CPU to read & write data directly to this texture?
+@@ -346,6 +353,7 @@ class Texture final : public Resource,
+                                      TextureRef *refOut);
+ 
+     Texture(id<MTLTexture> metalTexture);
++    Texture(Buffer *buffer, id<MTLTexture> metalTexture);
+ 
+     // Create a texture that shares ownership of usageRef, underlying MTLTexture and colorWriteMask
+     // with the original texture.
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.mm b/src/libANGLE/renderer/metal/mtl_resources.mm
+index 1b7be4ff3..2ecac412e 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.mm
++++ b/src/libANGLE/renderer/metal/mtl_resources.mm
+@@ -292,6 +292,38 @@ MTLResourceOptions resourceOptionsForStorageMode(MTLStorageMode storageMode)
+     }  // ANGLE_MTL_OBJC_SCOPE
+ }
+ 
++/** static */
++angle::Result Texture::MakeBufferTexture(ContextMtl *context,
++                                         const BufferRef &buffer,
++                                         const Format &format,
++                                         uint32_t width,
++                                         size_t offset,
++                                         size_t bytesPerRow,
++                                         TextureRef *refOut)
++{
++    ANGLE_MTL_OBJC_SCOPE
++    {
++        ASSERT(buffer && buffer->valid());
++        ASSERT(refOut);
++
++        MTLTextureDescriptor *desc = [MTLTextureDescriptor
++            textureBufferDescriptorWithPixelFormat:format.metalFormat
++                                             width:width
++                                   resourceOptions:buffer->get().resourceOptions
++                                             usage:MTLTextureUsageShaderRead];
++
++        auto metalTexture = adoptObjCObj([buffer->get() newTextureWithDescriptor:desc
++                                                                         offset:offset
++                                                                    bytesPerRow:bytesPerRow]);
++        ANGLE_MTL_CHECK(context, metalTexture, GL_OUT_OF_MEMORY);
++        context->getMetalDevice().setOwnerWithIdentity(metalTexture);
++
++        refOut->reset(new Texture(buffer.get(), metalTexture));
++        refOut->get()->setColorWritableMask(GetEmulatedColorWriteMask(format));
++        return angle::Result::Continue;
++    }  // ANGLE_MTL_OBJC_SCOPE
++}
++
+ /** static */
+ angle::Result Texture::MakeTexture(ContextMtl *context,
+                                    const Format &mtlFormat,
+@@ -389,6 +421,13 @@ bool needMultisampleColorFormatShaderReadWorkaround(ContextMtl *context, MTLText
+     set(metalTexture);
+ }
+ 
++Texture::Texture(Buffer *buffer, id<MTLTexture> metalTexture)
++    : Resource(buffer),
++      mColorWritableMask(std::make_shared<MTLColorWriteMask>(MTLColorWriteMaskAll))
++{
++    set(metalTexture);
++}
++
+ Texture::Texture(std::shared_ptr<UsageRef> usageRef,
+                  id<MTLTexture> metalTexture,
+                  std::shared_ptr<MTLColorWriteMask> colorWriteMask)
+diff --git a/src/libANGLE/validationES32.cpp b/src/libANGLE/validationES32.cpp
+index f170fc4d8..bee06cab7 100644
+--- a/src/libANGLE/validationES32.cpp
++++ b/src/libANGLE/validationES32.cpp
+@@ -740,7 +740,10 @@ bool ValidateTexBuffer(const Context *context,
+                        GLenum internalformat,
+                        BufferID buffer)
+ {
+-    if (context->getClientVersion() < ES_3_2)
++    if ((context->getClientType() == EGL_OPENGL_API &&
++         context->getClientVersion() < Version(3, 1)) ||
++        (context->getClientType() != EGL_OPENGL_API &&
++         context->getClientVersion() < ES_3_2))
+     {
+         ANGLE_VALIDATION_ERROR(GL_INVALID_OPERATION, kES32Required);
+         return false;
+@@ -757,7 +760,10 @@ bool ValidateTexBufferRange(const Context *context,
+                             GLintptr offset,
+                             GLsizeiptr size)
+ {
+-    if (context->getClientVersion() < ES_3_2)
++    if ((context->getClientType() == EGL_OPENGL_API &&
++         context->getClientVersion() < Version(3, 1)) ||
++        (context->getClientType() != EGL_OPENGL_API &&
++         context->getClientVersion() < ES_3_2))
+     {
+         ANGLE_VALIDATION_ERROR(GL_INVALID_OPERATION, kES32Required);
+         return false;
+diff --git a/src/tests/gl_tests/DesktopGLSLTest.cpp b/src/tests/gl_tests/DesktopGLSLTest.cpp
+index f27baaf79..d9c46a27d 100644
+--- a/src/tests/gl_tests/DesktopGLSLTest.cpp
++++ b/src/tests/gl_tests/DesktopGLSLTest.cpp
+@@ -157,7 +157,71 @@ TEST_P(DesktopGLSLTest, ImplicitConversionFunction)
+     ASSERT_NE(static_cast<unsigned int>(0), CompileShader(GL_FRAGMENT_SHADER, kFS));
+ }
+ 
++class DesktopMetalTextureBufferTest : public ANGLETest<>
++{
++  protected:
++    DesktopMetalTextureBufferTest()
++    {
++        setWindowWidth(16);
++        setWindowHeight(16);
++        setConfigRedBits(8);
++        setConfigGreenBits(8);
++        setConfigBlueBits(8);
++        setConfigAlphaBits(8);
++    }
++};
++
++// Regression for a Desktop GL frontend/backend mismatch that left the zero texture uninitialized
++// and TextureMtl::setBuffer unimplemented. A one-byte R8I buffer also exercises Metal's required
++// row padding, and reallocating the buffer verifies that the native texture view is refreshed.
++TEST_P(DesktopMetalTextureBufferTest, R8ITextureBufferDrawAndReallocate)
++{
++    constexpr char kVS[] = R"(#version 330 core
++in vec4 position;
++void main()
++{
++    gl_Position = position;
++})";
++
++    constexpr char kFS[] = R"(#version 330 core
++uniform isamplerBuffer bufferTexture;
++out vec4 colorOut;
++void main()
++{
++    int value = texelFetch(bufferTexture, 0).r;
++    colorOut = value == 7 ? vec4(1.0, 0.0, 0.0, 1.0)
++                          : (value == 9 ? vec4(0.0, 1.0, 0.0, 1.0)
++                                        : vec4(0.0, 0.0, 1.0, 1.0));
++})";
++
++    ANGLE_GL_PROGRAM(program, kVS, kFS);
++
++    GLBuffer buffer;
++    glBindBuffer(GL_TEXTURE_BUFFER, buffer);
++    GLbyte value = 7;
++    glBufferData(GL_TEXTURE_BUFFER, sizeof(value), &value, GL_DYNAMIC_DRAW);
++
++    GLTexture texture;
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_BUFFER, texture);
++    glTexBuffer(GL_TEXTURE_BUFFER, GL_R8I, buffer);
++    ASSERT_GL_NO_ERROR();
++
++    drawQuad(program, "position", 0.5f);
++    ASSERT_GL_NO_ERROR();
++    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::red);
++
++    value = 9;
++    glBufferData(GL_TEXTURE_BUFFER, sizeof(value), &value, GL_DYNAMIC_DRAW);
++    drawQuad(program, "position", 0.5f);
++    ASSERT_GL_NO_ERROR();
++    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
++}
++
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(DesktopGLSLTest);
+ ANGLE_INSTANTIATE_TEST_GL32_CORE(DesktopGLSLTest);
+ 
++GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(DesktopMetalTextureBufferTest);
++ANGLE_INSTANTIATE_TEST(DesktopMetalTextureBufferTest, GL32_CORE_METAL());
++
+ }  // namespace angle
+diff --git a/src/tests/test_utils/angle_test_configs.cpp b/src/tests/test_utils/angle_test_configs.cpp
+index b52d1a3e7..7c01d02a8 100644
+--- a/src/tests/test_utils/angle_test_configs.cpp
++++ b/src/tests/test_utils/angle_test_configs.cpp
+@@ -867,6 +867,12 @@ PlatformParameters GL32_CORE_VULKAN_SWIFTSHADER()
+                               egl_platform::VULKAN_SWIFTSHADER());
+ }
+ 
++PlatformParameters GL32_CORE_METAL()
++{
++    return PlatformParameters(EGL_OPENGL_API, 3, 2, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
++                              egl_platform::METAL());
++}
++
+ PlatformParameters ES1_METAL()
+ {
+     return PlatformParameters(EGL_OPENGL_ES_API, 1, 0, 0, egl_platform::METAL());
+diff --git a/src/tests/test_utils/angle_test_configs.h b/src/tests/test_utils/angle_test_configs.h
+index 543994170..1cc6c70bf 100644
+--- a/src/tests/test_utils/angle_test_configs.h
++++ b/src/tests/test_utils/angle_test_configs.h
+@@ -210,6 +210,7 @@ PlatformParameters ES32_VULKAN_NULL();
+ PlatformParameters ES32_VULKAN_SWIFTSHADER();
+ PlatformParameters GL32_CORE_VULKAN();
+ PlatformParameters GL32_CORE_VULKAN_SWIFTSHADER();
++PlatformParameters GL32_CORE_METAL();
+ 
+ PlatformParameters ES1_METAL();
+ PlatformParameters ES2_METAL();
+-- 
+2.50.1 (Apple Git-155)
+

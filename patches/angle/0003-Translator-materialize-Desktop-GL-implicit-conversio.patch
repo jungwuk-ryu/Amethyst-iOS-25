@@ -1,0 +1,738 @@
+From c93cf68bc65578f549a563cffd490f82681722b0 Mon Sep 17 00:00:00 2001
+From: Amethyst Contributors <amethyst@example.invalid>
+Date: Wed, 29 Jul 2026 16:40:31 +0900
+Subject: [PATCH 3/6] Translator: materialize Desktop GL implicit conversions
+
+---
+ src/compiler/translator/ParseContext.cpp    | 277 ++++++++++++++++-
+ src/compiler/translator/ParseContext.h      |  15 +
+ src/tests/compiler_tests/MSLOutput_test.cpp | 327 +++++++++++++++++++-
+ 3 files changed, 607 insertions(+), 12 deletions(-)
+
+diff --git a/src/compiler/translator/ParseContext.cpp b/src/compiler/translator/ParseContext.cpp
+index 46d359110..6ee8fde16 100644
+--- a/src/compiler/translator/ParseContext.cpp
++++ b/src/compiler/translator/ParseContext.cpp
+@@ -109,6 +109,46 @@ bool CanSetDefaultPrecisionOnType(const TPublicType &type)
+     return true;
+ }
+ 
++TIntermTyped *CreateImplicitFloatConversion(TIntermTyped *operand,
++                                            const TSourceLoc &loc,
++                                            TDiagnostics *diagnostics)
++{
++    ASSERT(operand->getBasicType() == EbtInt || operand->getBasicType() == EbtUInt);
++
++    TType convertedType(operand->getType());
++    convertedType.setBasicType(EbtFloat);
++    convertedType.setInvariant(false);
++    convertedType.setPrecise(false);
++    convertedType.setInterpolant(false);
++    convertedType.setMemoryQualifier(TMemoryQualifier::Create());
++    convertedType.setLayoutQualifier(TLayoutQualifier::Create());
++    convertedType.setInterfaceBlock(nullptr);
++
++    TIntermAggregate *conversion = TIntermAggregate::CreateConstructor(convertedType, {operand});
++    conversion->setLine(loc);
++    return conversion->fold(diagnostics);
++}
++
++bool DoImplicitConversionRanksDominate(const std::vector<unsigned int> &candidateRanks,
++                                       const std::vector<unsigned int> &otherRanks)
++{
++    ASSERT(candidateRanks.size() == otherRanks.size());
++
++    bool hasBetterRank = false;
++    for (size_t index = 0; index < candidateRanks.size(); ++index)
++    {
++        if (candidateRanks[index] > otherRanks[index])
++        {
++            return false;
++        }
++        hasBetterRank = hasBetterRank || candidateRanks[index] < otherRanks[index];
++    }
++    return hasBetterRank;
++}
++
++constexpr unsigned int kExactMatchConversionRank = 0;
++constexpr unsigned int kImplicitConversionRank   = 1;
++
+ // Map input primitive types to input array sizes in a geometry shader.
+ GLuint GetGeometryShaderInputArraySize(TLayoutPrimitiveType primitiveType)
+ {
+@@ -2853,6 +2893,8 @@ bool TParseContext::executeInitializer(const TSourceLoc &line,
+         return false;
+     }
+ 
++    initializer = materializeImplicitIntToFloatConversion(variable->getType(), initializer, line);
++
+     if (qualifier == EvqConst)
+     {
+         // Save the constant folded value to the variable if possible.
+@@ -6917,6 +6959,11 @@ bool TParseContext::binaryOpCommonCheck(TOperator op,
+             error(loc, "array size mismatch", GetOperatorString(op));
+             return false;
+         }
++        if (left->getType() != right->getType())
++        {
++            error(loc, "array type mismatch", GetOperatorString(op));
++            return false;
++        }
+     }
+ 
+     // Check ops which require integer / ivec parameters
+@@ -7097,6 +7144,202 @@ bool TParseContext::isMultiplicationTypeCombinationValid(TOperator op,
+     }
+ }
+ 
++void TParseContext::materializeImplicitIntToFloatConversion(TIntermTyped **left,
++                                                            TIntermTyped **right,
++                                                            const TSourceLoc &loc)
++{
++    if ((*left)->isArray() || (*right)->isArray())
++    {
++        ASSERT((*left)->getType() == (*right)->getType());
++        return;
++    }
++
++    const ImplicitTypeConversion conversion =
++        GetConversion((*left)->getBasicType(), (*right)->getBasicType());
++
++    switch (conversion)
++    {
++        case ImplicitTypeConversion::Left:
++            markStaticReadIfSymbol(*left);
++            *left = CreateImplicitFloatConversion(*left, loc, mDiagnostics);
++            break;
++        case ImplicitTypeConversion::Right:
++            markStaticReadIfSymbol(*right);
++            *right = CreateImplicitFloatConversion(*right, loc, mDiagnostics);
++            break;
++        case ImplicitTypeConversion::Same:
++        case ImplicitTypeConversion::Invalid:
++            break;
++    }
++}
++
++TIntermTyped *TParseContext::materializeImplicitIntToFloatConversion(const TType &expectedType,
++                                                                     TIntermTyped *operand,
++                                                                     const TSourceLoc &loc)
++{
++    if (expectedType.isArray() || operand->isArray())
++    {
++        ASSERT(expectedType == operand->getType());
++        return operand;
++    }
++
++    const ImplicitTypeConversion conversion =
++        GetConversion(expectedType.getBasicType(), operand->getBasicType());
++    if (conversion != ImplicitTypeConversion::Right)
++    {
++        return operand;
++    }
++
++    ASSERT(IsDesktopGLSpec(mShaderSpec));
++    ASSERT(expectedType.getBasicType() == EbtFloat);
++    markStaticReadIfSymbol(operand);
++    return CreateImplicitFloatConversion(operand, loc, mDiagnostics);
++}
++
++bool TParseContext::materializeImplicitIntToFloatConversions(const TFunction &function,
++                                                             TIntermSequence *arguments,
++                                                             const TSourceLoc &loc)
++{
++    ASSERT(function.getParamCount() == arguments->size());
++
++    for (size_t index = 0; index < arguments->size(); ++index)
++    {
++        const TType &parameterType = function.getParam(index)->getType();
++        TIntermTyped *argument     = (*arguments)[index]->getAsTyped();
++        const ImplicitTypeConversion conversion =
++            GetConversion(parameterType.getBasicType(), argument->getBasicType());
++        if (conversion == ImplicitTypeConversion::Same)
++        {
++            continue;
++        }
++
++        const TQualifier qualifier = parameterType.getQualifier();
++        if (conversion != ImplicitTypeConversion::Right || qualifier == EvqParamOut ||
++            qualifier == EvqParamInOut || parameterType.isArray() || argument->isArray() ||
++            parameterType.getNominalSize() != argument->getNominalSize() ||
++            parameterType.getSecondarySize() != argument->getSecondarySize())
++        {
++            return false;
++        }
++
++        ASSERT(IsDesktopGLSpec(mShaderSpec));
++        (*arguments)[index] = materializeImplicitIntToFloatConversion(parameterType, argument, loc);
++    }
++    return true;
++}
++
++bool TParseContext::getImplicitConversionRanks(const TFunction &function,
++                                               const TIntermSequence &arguments,
++                                               std::vector<unsigned int> *conversionRanks) const
++{
++    ASSERT(function.getParamCount() == arguments.size());
++    ASSERT(conversionRanks != nullptr);
++    conversionRanks->clear();
++    conversionRanks->reserve(arguments.size());
++
++    for (size_t index = 0; index < arguments.size(); ++index)
++    {
++        const TType &parameterType = function.getParam(index)->getType();
++        const TType &argumentType  = arguments[index]->getAsTyped()->getType();
++        if (parameterType == argumentType)
++        {
++            conversionRanks->push_back(kExactMatchConversionRank);
++            continue;
++        }
++
++        const TQualifier qualifier = parameterType.getQualifier();
++        if (qualifier == EvqParamOut || qualifier == EvqParamInOut || parameterType.isArray() ||
++            argumentType.isArray() ||
++            GetConversion(parameterType.getBasicType(), argumentType.getBasicType()) !=
++                ImplicitTypeConversion::Right)
++        {
++            return false;
++        }
++
++        TType convertedArgumentType(argumentType);
++        convertedArgumentType.setBasicType(EbtFloat);
++        if (convertedArgumentType != parameterType)
++        {
++            return false;
++        }
++        conversionRanks->push_back(kImplicitConversionRank);
++    }
++    return true;
++}
++
++const TSymbol *TParseContext::findFunctionWithImplicitConversions(TFunctionLookup &fnCall,
++                                                                  bool builtIn,
++                                                                  bool *isAmbiguous) const
++{
++    ASSERT(isAmbiguous != nullptr);
++    *isAmbiguous = false;
++
++    struct Candidate
++    {
++        const TSymbol *symbol;
++        std::vector<unsigned int> conversionRanks;
++    };
++
++    std::vector<Candidate> candidates;
++    for (const ImmutableString &name : fnCall.getMangledNamesForImplicitConversions())
++    {
++        const TSymbol *symbol =
++            builtIn ? symbolTable.findBuiltIn(name, mShaderVersion) : symbolTable.findGlobal(name);
++        if (symbol == nullptr || !symbol->isFunction())
++        {
++            continue;
++        }
++
++        const TFunction *candidate = static_cast<const TFunction *>(symbol);
++        std::vector<unsigned int> conversionRanks;
++        if (!getImplicitConversionRanks(*candidate, fnCall.arguments(), &conversionRanks))
++        {
++            continue;
++        }
++
++        candidates.push_back({symbol, conversionRanks});
++    }
++
++    if (candidates.empty())
++    {
++        return nullptr;
++    }
++    if (candidates.size() == 1)
++    {
++        return candidates[0].symbol;
++    }
++
++    // Before GLSL 4.10, any call with more than one viable implicit-conversion overload is
++    // ambiguous.  GLSL 4.10 introduced per-argument conversion ranking.
++    if (mShaderVersion < 410)
++    {
++        *isAmbiguous = true;
++        return nullptr;
++    }
++
++    for (const Candidate &candidate : candidates)
++    {
++        bool dominatesEveryOtherCandidate = true;
++        for (const Candidate &other : candidates)
++        {
++            if (candidate.symbol != other.symbol &&
++                !DoImplicitConversionRanksDominate(candidate.conversionRanks,
++                                                   other.conversionRanks))
++            {
++                dominatesEveryOtherCandidate = false;
++                break;
++            }
++        }
++        if (dominatesEveryOtherCandidate)
++        {
++            return candidate.symbol;
++        }
++    }
++
++    *isAmbiguous = true;
++    return nullptr;
++}
++
+ TIntermTyped *TParseContext::addBinaryMathInternal(TOperator op,
+                                                    TIntermTyped *left,
+                                                    TIntermTyped *right,
+@@ -7105,6 +7348,8 @@ TIntermTyped *TParseContext::addBinaryMathInternal(TOperator op,
+     if (!binaryOpCommonCheck(op, left, right, loc))
+         return nullptr;
+ 
++    materializeImplicitIntToFloatConversion(&left, &right, loc);
++
+     switch (op)
+     {
+         case EOpEqual:
+@@ -7205,6 +7450,8 @@ TIntermTyped *TParseContext::addAssign(TOperator op,
+     TIntermBinary *node = nullptr;
+     if (binaryOpCommonCheck(op, left, right, loc))
+     {
++        materializeImplicitIntToFloatConversion(&left, &right, loc);
++
+         TIntermBinary *lValue = left->getAsBinaryNode();
+         if ((lValue != nullptr) &&
+             (lValue->getOp() == EOpIndexIndirect || lValue->getOp() == EOpIndexDirect) &&
+@@ -7777,9 +8024,13 @@ TIntermTyped *TParseContext::addNonConstructorFunctionCallImpl(TFunctionLookup *
+ 
+         if (symbol == nullptr && IsDesktopGLSpec(mShaderSpec))
+         {
+-            // If using Desktop GL spec, need to check for implicit conversion
+-            symbol = symbolTable.findGlobalWithConversion(
+-                fnCall->getMangledNamesForImplicitConversions());
++            bool isAmbiguous = false;
++            symbol           = findFunctionWithImplicitConversions(*fnCall, false, &isAmbiguous);
++            if (isAmbiguous)
++            {
++                error(loc, "ambiguous overloaded function call", fnCall->name());
++                return nullptr;
++            }
+         }
+ 
+         if (symbol != nullptr)
+@@ -7787,6 +8038,11 @@ TIntermTyped *TParseContext::addNonConstructorFunctionCallImpl(TFunctionLookup *
+             // A user-defined function - could be an overloaded built-in as well.
+             ASSERT(symbol->symbolType() == SymbolType::UserDefined);
+             const TFunction *fnCandidate = static_cast<const TFunction *>(symbol);
++            if (!materializeImplicitIntToFloatConversions(*fnCandidate, &fnCall->arguments(), loc))
++            {
++                error(loc, "no matching overloaded function found", fnCall->name());
++                return CreateZeroNode(fnCandidate->getReturnType());
++            }
+             TIntermAggregate *callNode =
+                 TIntermAggregate::CreateFunctionCall(*fnCandidate, &fnCall->arguments());
+             callNode->setLine(loc);
+@@ -7799,9 +8055,13 @@ TIntermTyped *TParseContext::addNonConstructorFunctionCallImpl(TFunctionLookup *
+ 
+         if (symbol == nullptr && IsDesktopGLSpec(mShaderSpec))
+         {
+-            // If using Desktop GL spec, need to check for implicit conversion
+-            symbol = symbolTable.findBuiltInWithConversion(
+-                fnCall->getMangledNamesForImplicitConversions(), mShaderVersion);
++            bool isAmbiguous = false;
++            symbol           = findFunctionWithImplicitConversions(*fnCall, true, &isAmbiguous);
++            if (isAmbiguous)
++            {
++                error(loc, "ambiguous overloaded function call", fnCall->name());
++                return nullptr;
++            }
+         }
+ 
+         if (symbol != nullptr)
+@@ -7809,6 +8069,11 @@ TIntermTyped *TParseContext::addNonConstructorFunctionCallImpl(TFunctionLookup *
+             // A built-in function.
+             ASSERT(symbol->symbolType() == SymbolType::BuiltIn);
+             const TFunction *fnCandidate = static_cast<const TFunction *>(symbol);
++            if (!materializeImplicitIntToFloatConversions(*fnCandidate, &fnCall->arguments(), loc))
++            {
++                error(loc, "no matching overloaded function found", fnCall->name());
++                return CreateZeroNode(fnCandidate->getReturnType());
++            }
+ 
+             if (!fnCandidate->extensions().empty() &&
+                 fnCandidate->extensions()[0] != TExtension::UNDEFINED)
+diff --git a/src/compiler/translator/ParseContext.h b/src/compiler/translator/ParseContext.h
+index b4fde1bb2..b500f4aac 100644
+--- a/src/compiler/translator/ParseContext.h
++++ b/src/compiler/translator/ParseContext.h
+@@ -681,6 +681,21 @@ class TParseContext : angle::NonCopyable
+                              TIntermTyped *left,
+                              TIntermTyped *right,
+                              const TSourceLoc &loc);
++    void materializeImplicitIntToFloatConversion(TIntermTyped **left,
++                                                 TIntermTyped **right,
++                                                 const TSourceLoc &loc);
++    TIntermTyped *materializeImplicitIntToFloatConversion(const TType &expectedType,
++                                                          TIntermTyped *operand,
++                                                          const TSourceLoc &loc);
++    bool materializeImplicitIntToFloatConversions(const TFunction &function,
++                                                  TIntermSequence *arguments,
++                                                  const TSourceLoc &loc);
++    bool getImplicitConversionRanks(const TFunction &function,
++                                    const TIntermSequence &arguments,
++                                    std::vector<unsigned int> *conversionRanks) const;
++    const TSymbol *findFunctionWithImplicitConversions(TFunctionLookup &fnCall,
++                                                       bool builtIn,
++                                                       bool *isAmbiguous) const;
+ 
+     TIntermFunctionPrototype *createPrototypeNodeFromFunction(const TFunction &function,
+                                                               const TSourceLoc &location,
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 91ffd7fd0..31fddbd8b 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -103,21 +103,336 @@ TEST(MSLOutputDesktopGLTest, ShareableFragmentShaderFindsInternalMetalBuiltIns)
+     ShBuiltInResources resources;
+     InitBuiltInResources(&resources);
+ 
+-    ShCompileOptions compileOptions                  = {};
+-    compileOptions.rescopeGlobalVariables            = true;
+-    compileOptions.validateAST                       = true;
+-    compileOptions.metal.generateShareableShaders    = true;
++    ShCompileOptions compileOptions               = {};
++    compileOptions.rescopeGlobalVariables         = true;
++    compileOptions.validateAST                    = true;
++    compileOptions.metal.generateShareableShaders = true;
+ 
+     std::string translatedCode;
+     std::string infoLog;
+-    ASSERT_TRUE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT,
+-                                  kShader, &resources, compileOptions, &translatedCode, &infoLog))
++    ASSERT_TRUE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
+         << infoLog;
+ 
+     EXPECT_NE(translatedCode.find("metal::saturate"), std::string::npos);
+     EXPECT_NE(translatedCode.find("metal::get_num_samples"), std::string::npos);
+ }
+ 
++// Desktop GLSL permits int and uint expressions to be implicitly converted to
++// float when the other operand is floating point.  The converted type must be
++// represented in the AST so strongly typed backends such as Metal do not emit
++// invalid operations such as int2 / float.
++TEST(MSLOutputDesktopGLTest, MaterializesImplicitIntegerToFloatConversion)
++{
++    constexpr char kShader[] = R"(#version 330
++        layout(location = 0) in ivec2 UV2;
++        out vec2 texCoord;
++
++        void main()
++        {
++            texCoord = clamp(UV2 / 256.0 + 0.03125,
++                             vec2(0.03125),
++                             vec2(0.96875));
++            gl_Position = vec4(0.0);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_VERTEX_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_TRUE(
++        std::regex_search(translatedCode, std::regex(R"(metal::float2\([^\n]*UV2[^\n]*\))")))
++        << translatedCode;
++}
++
++TEST(MSLOutputDesktopGLTest, MaterializesImplicitConversionInDeclarationInitializer)
++{
++    constexpr char kShader[] = R"(#version 330
++        layout(location = 0) in ivec2 UV2;
++        out vec2 texCoord;
++
++        void main()
++        {
++            vec2 converted = UV2;
++            texCoord = converted;
++            gl_Position = vec4(0.0);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_VERTEX_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_TRUE(
++        std::regex_search(translatedCode, std::regex(R"(metal::float2\([^\n]*UV2[^\n]*\))")))
++        << translatedCode;
++}
++
++TEST(MSLOutputDesktopGLTest, MaterializesImplicitConversionInFunctionCall)
++{
++    constexpr char kShader[] = R"(#version 330
++        layout(location = 0) in ivec2 UV2;
++        out vec2 texCoord;
++
++        vec2 passThrough(vec2 value)
++        {
++            return value;
++        }
++
++        void main()
++        {
++            texCoord = passThrough(UV2);
++            gl_Position = vec4(0.0);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_VERTEX_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_TRUE(
++        std::regex_search(translatedCode, std::regex(R"(metal::float2\([^\n]*UV2[^\n]*\))")))
++        << translatedCode;
++    EXPECT_TRUE(
++        std::regex_search(translatedCode, std::regex(R"(_upassThrough\(ANGLE_[A-Za-z0-9_]+\))")))
++        << translatedCode;
++}
++
++TEST(MSLOutputDesktopGLTest, MaterializesImplicitConversionInAssignmentAndBuiltInCall)
++{
++    constexpr char kShader[] = R"(#version 330
++        layout(location = 0) in ivec2 UV2;
++        uniform int scale;
++        out vec2 texCoord;
++
++        void main()
++        {
++            vec2 converted;
++            converted = UV2;
++            converted += UV2;
++            float limited = clamp(scale, 0.0, 1.0);
++            texCoord = converted * limited;
++            gl_Position = vec4(0.0);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_VERTEX_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_TRUE(
++        std::regex_search(translatedCode, std::regex(R"(metal::float2\([^\n]*UV2[^\n]*\))")))
++        << translatedCode;
++    EXPECT_TRUE(std::regex_search(translatedCode, std::regex(R"(float\([^\n]*scale[^\n]*\))")))
++        << translatedCode;
++}
++
++TEST(MSLOutputDesktopGLTest, SelectsViableImplicitConversionOverOutParameter)
++{
++    constexpr char kShader[] = R"(#version 330
++        out vec4 fragColor;
++
++        float choose(out float x, int y)
++        {
++            x = float(y);
++            return x;
++        }
++
++        float choose(int x, float y)
++        {
++            return float(x) + y;
++        }
++
++        void main()
++        {
++            int first = 1;
++            int second = 2;
++            fragColor = vec4(choose(first, second));
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++}
++
++TEST(MSLOutputDesktopGLTest, RejectsMultipleViableImplicitConversionOverloadsBeforeGLSL410)
++{
++    constexpr char kShader[] = R"(#version 330
++        out vec4 fragColor;
++
++        float choose(float x, int y)
++        {
++            return x + float(y);
++        }
++
++        float choose(float x, float y)
++        {
++            return x + y;
++        }
++
++        void main()
++        {
++            int first = 1;
++            int second = 2;
++            fragColor = vec4(choose(first, second));
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    EXPECT_FALSE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT,
++                                   kShader, &resources, compileOptions, &translatedCode, &infoLog));
++    EXPECT_NE(infoLog.find("ambiguous overloaded function call"), std::string::npos) << infoLog;
++}
++
++TEST(MSLOutputDesktopGLTest, RejectsIncomparableImplicitConversionOverloadsInGLSL410)
++{
++    constexpr char kShader[] = R"(#version 410
++        out vec4 fragColor;
++
++        float choose(float x, int y, int z)
++        {
++            return x + float(y + z);
++        }
++
++        float choose(int x, float y, float z)
++        {
++            return float(x) + y + z;
++        }
++
++        void main()
++        {
++            int first = 1;
++            int second = 2;
++            int third = 3;
++            fragColor = vec4(choose(first, second, third));
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    EXPECT_FALSE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT,
++                                   kShader, &resources, compileOptions, &translatedCode, &infoLog));
++    EXPECT_NE(infoLog.find("ambiguous overloaded function call"), std::string::npos) << infoLog;
++}
++
++TEST(MSLOutputDesktopGLTest, SelectsDominatingImplicitConversionOverloadInGLSL410)
++{
++    constexpr char kShader[] = R"(#version 410
++        out vec4 fragColor;
++
++        float choose(float x, int y)
++        {
++            return x + float(y);
++        }
++
++        float choose(float x, float y)
++        {
++            return x + y;
++        }
++
++        void main()
++        {
++            int first = 1;
++            int second = 2;
++            fragColor = vec4(choose(first, second));
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    EXPECT_TRUE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++}
++
++TEST(MSLOutputDesktopGLTest, RejectsImplicitArrayConversion)
++{
++    constexpr char kShader[] = R"(#version 330
++        out vec4 fragColor;
++
++        void main()
++        {
++            float floats[2];
++            int integers[2];
++            floats = integers;
++            fragColor = vec4(floats[0]);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    EXPECT_FALSE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT,
++                                   kShader, &resources, compileOptions, &translatedCode, &infoLog));
++    EXPECT_NE(infoLog.find("array type mismatch"), std::string::npos) << infoLog;
++}
++
+ // Test that having dynamic indexing of a vector inside the right hand side of logical or doesn't
+ // trigger asserts in MSL output.
+ TEST_F(MSLOutputTest, DynamicIndexingOfVectorOnRightSideOfLogicalOr)
+-- 
+2.50.1 (Apple Git-155)
+

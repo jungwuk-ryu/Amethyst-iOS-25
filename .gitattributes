@@ -1,0 +1,2 @@
+patches/angle/*.patch -whitespace
+Natives/resources/Frameworks/ANGLE_THIRD_PARTY_LICENSES/* -whitespace

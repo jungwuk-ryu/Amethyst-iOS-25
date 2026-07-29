@@ -14,6 +14,12 @@ BRANCH      := $(shell git branch --show-current 2>/dev/null || echo "unknown")
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 PLATFORM    ?= 2
 
+ifeq ($(PLATFORM),7)
+APPLE_SDK_NAME := iphonesimulator
+else
+APPLE_SDK_NAME := iphoneos
+endif
+
 # Release vs Debug
 RELEASE ?= 0
 
@@ -55,7 +61,7 @@ ifeq ($(DETECTPLAT),Darwin)
 OSVER       := $(shell sw_vers -productVersion | cut -b 1-2)
 ifeq ($(shell sw_vers -productName),macOS)
 IOS         := 0
-SDKPATH     ?= $(shell xcrun --sdk iphoneos --show-sdk-path)
+SDKPATH     ?= $(shell xcrun --sdk $(APPLE_SDK_NAME) --show-sdk-path)
 BOOTJDK     ?= $(shell /usr/libexec/java_home -v 1.8)/bin
 $(warning Building on macOS.)
 else
@@ -104,6 +110,25 @@ else
 $(error PLATFORM is not valid.)
 endif
 
+ifeq ($(PLATFORM),7)
+AMETHYST_SIMULATOR := ON
+CMAKE_SYSTEM_NAME := iOS
+ASSET_PLATFORM := iphonesimulator
+APPLE_DEPLOYMENT_TARGET := 16.0
+SIMULATOR_FRAMEWORK_SOURCE ?= $(SOURCEDIR)/Natives/resources/FrameworksSimulator
+SIMULATOR_FRAMEWORK_DIR := $(WORKINGDIR)/simulator-frameworks
+NATIVE_FRAMEWORK_DIR := $(SIMULATOR_FRAMEWORK_DIR)
+NATIVE_DEPENDENCIES := simulator_frameworks
+SDK_VERSION := $(shell xcrun --sdk iphonesimulator --show-sdk-version)
+else
+AMETHYST_SIMULATOR := OFF
+CMAKE_SYSTEM_NAME := Darwin
+ASSET_PLATFORM := iphoneos
+APPLE_DEPLOYMENT_TARGET := 14.0
+NATIVE_FRAMEWORK_DIR := $(SOURCEDIR)/Natives/resources/Frameworks
+NATIVE_DEPENDENCIES := dep_mg
+endif
+
 POJAV_BUNDLE_DIR      ?= $(OUTPUTDIR)/AngelAuraAmethyst.app
 POJAV_JRE8_DIR        ?= $(SOURCEDIR)/depends/java-8-openjdk
 POJAV_JRE17_DIR       ?= $(SOURCEDIR)/depends/java-17-openjdk
@@ -134,7 +159,9 @@ METHOD_DIRCHECK   = \
 # https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h
 # TODO: Change Info.plist for visionOS 1.0
 METHOD_CHANGE_PLAT = \
-	if [ '$(1)' != '11' ] && [ '$(1)' != '12' ]; then \
+	if [ '$(1)' = '7' ]; then \
+		vtool -arch arm64 -set-build-version $(1) 16.0 $(SDK_VERSION) -replace -output $(2) $(2); \
+	elif [ '$(1)' != '11' ] && [ '$(1)' != '12' ]; then \
 		vtool -arch arm64 -set-build-version $(1) 14.0 16.0 -replace -output $(2) $(2); \
 		ldid -S -M $(2); \
 	else \
@@ -149,10 +176,39 @@ METHOD_PACKAGE = \
 		IPA_SUFFIX=".ipa"; \
 	fi; \
 	if [ '$(SLIMMED_ONLY)' = '0' ]; then \
-		zip --symlinks -r $(OUTPUTDIR)/org.angelauramc.amethyst-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX Payload; \
+		FULL_IPA="$(OUTPUTDIR)/org.angelauramc.amethyst-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX"; \
+		rm -f "$$FULL_IPA"; \
+		zip --symlinks -r "$$FULL_IPA" Payload; \
 	fi; \
 	if [ '$(SLIMMED)' = '1' ] || [ '$(SLIMMED_ONLY)' = '1' ]; then \
-		zip --symlinks -r $(OUTPUTDIR)/org.angelauramc.amethyst.slimmed-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX Payload --exclude='Payload/AngelAuraAmethyst.app/java_runtimes/*'; \
+		SLIM_IPA="$(OUTPUTDIR)/org.angelauramc.amethyst.slimmed-$(VERSION)-$(PLATFORM_NAME)$$IPA_SUFFIX"; \
+		rm -f "$$SLIM_IPA"; \
+		if [ '$(SLIMMED_ONLY)' = '1' ]; then \
+			zip --symlinks -r "$$SLIM_IPA" Payload; \
+		else \
+			SLIM_ROOT="$(OUTPUTDIR)/.slimmed-package"; \
+			rm -rf "$$SLIM_ROOT"; \
+			mkdir -p "$$SLIM_ROOT"; \
+			cp -R Payload "$$SLIM_ROOT/Payload"; \
+			rm -rf "$$SLIM_ROOT/Payload/AngelAuraAmethyst.app/java_runtimes"; \
+			SLIM_APP="$$SLIM_ROOT/Payload/AngelAuraAmethyst.app"; \
+			if [ '$(TEAMID)' != '-1' ] && [ '$(SIGNING_TEAMID)' != '-1' ] && [ -f '$(PROVISIONING)' ] && [ -f '$(SOURCEDIR)/entitlements.codesign.xml' ]; then \
+				codesign -f -s $(SIGNING_TEAMID) --generate-entitlement-der --entitlements $(SOURCEDIR)/entitlements.codesign.xml "$$SLIM_APP"; \
+			else \
+				ldid -S "$$SLIM_APP"; \
+				if [ '$(TROLLSTORE_JIT_ENT)' = '1' ]; then \
+					ldid -S$(SOURCEDIR)/entitlements.trollstore.xml "$$SLIM_APP/AngelAuraAmethyst"; \
+				elif [ '$(PLATFORM)' = '6' ] && [ -f '$(SOURCEDIR)/entitlements.codesign.xml' ]; then \
+					ldid -S$(SOURCEDIR)/entitlements.codesign.xml "$$SLIM_APP/AngelAuraAmethyst"; \
+				else \
+					ldid -S$(SOURCEDIR)/entitlements.sideload.xml "$$SLIM_APP/AngelAuraAmethyst"; \
+				fi; \
+			fi; \
+			cd "$$SLIM_ROOT"; \
+			zip --symlinks -r "$$SLIM_IPA" Payload; \
+			cd $(OUTPUTDIR); \
+			rm -rf "$$SLIM_ROOT"; \
+		fi; \
 	fi
 
 # Function to download and unpack Java runtimes.
@@ -256,31 +312,54 @@ check:
 		$(info $(shell printf "%-20s" "$(v)") = $(value $(v)))) \
 	)
 
-native: dep_mg
+native: $(NATIVE_DEPENDENCIES)
 	echo '[Amethyst v$(VERSION)] native - start'
 	mkdir -p $(WORKINGDIR)
 	cd $(WORKINGDIR) && cmake \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
 		-DCMAKE_CROSSCOMPILING=true \
-		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_NAME=$(CMAKE_SYSTEM_NAME) \
 		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
 		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
 		-DCMAKE_OSX_ARCHITECTURES=arm64 \
-		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=$(APPLE_DEPLOYMENT_TARGET) \
 		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DAMETHYST_SIMULATOR=$(AMETHYST_SIMULATOR) \
+		-DAMETHYST_FRAMEWORK_DIR="$(NATIVE_FRAMEWORK_DIR)" \
 		-DCONFIG_BRANCH="$(BRANCH)" \
 		-DCONFIG_COMMIT="$(COMMIT)" \
 		-DCONFIG_RELEASE=$(RELEASE) \
-		..
+		$(SOURCEDIR)/Natives
 
 	cmake --build $(WORKINGDIR) --config $(CMAKE_BUILD_TYPE) -j$(JOBS)
 	#	--target awt_headless awt_xawt libOSMesaOverride.dylib tinygl4angle AngelAuraAmethyst
 	rm $(WORKINGDIR)/libawt_headless.dylib
 	echo '[Amethyst v$(VERSION)] native - end'
 
+simulator_frameworks:
+	echo '[Amethyst v$(VERSION)] simulator_frameworks - start'
+	test -f "$(SIMULATOR_FRAMEWORK_SOURCE)/libEGL.framework/libEGL"
+	test -f "$(SIMULATOR_FRAMEWORK_SOURCE)/libGLESv2.framework/libGLESv2"
+	rm -rf "$(SIMULATOR_FRAMEWORK_DIR)"
+	mkdir -p "$(SIMULATOR_FRAMEWORK_DIR)"
+	cp -R "$(SOURCEDIR)/Natives/resources/Frameworks/." "$(SIMULATOR_FRAMEWORK_DIR)/"
+	cp -R "$(SIMULATOR_FRAMEWORK_SOURCE)/libEGL.framework" "$(SIMULATOR_FRAMEWORK_DIR)/"
+	cp -R "$(SIMULATOR_FRAMEWORK_SOURCE)/libGLESv2.framework" "$(SIMULATOR_FRAMEWORK_DIR)/"
+	$(call METHOD_MACHO,$(SIMULATOR_FRAMEWORK_DIR),$(call METHOD_CHANGE_PLAT,7,$$file))
+	find "$(SIMULATOR_FRAMEWORK_DIR)" -name Info.plist -print0 | while IFS= read -r -d '' plist; do \
+		plutil -replace CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$$plist" 2>/dev/null || \
+			plutil -insert CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$$plist"; \
+		for pair in DTPlatformName=iphonesimulator DTSDKName=iphonesimulator$(SDK_VERSION) DTPlatformVersion=$(SDK_VERSION) MinimumOSVersion=16.0; do \
+			key=$${pair%%=*}; value=$${pair#*=}; \
+			plutil -replace "$$key" -string "$$value" "$$plist" 2>/dev/null || \
+				plutil -insert "$$key" -string "$$value" "$$plist"; \
+		done; \
+	done
+	echo '[Amethyst v$(VERSION)] simulator_frameworks - end'
+
 java:
 	echo '[Amethyst v$(VERSION)] java - start'
-	$(MAKE) -C JavaApp -j$(JOBS) BOOTJDK=$(BOOTJDK)
+	$(MAKE) -C JavaApp -j$(JOBS) BOOTJDK=$(BOOTJDK) OUTPUTDIR=build
 	echo '[Amethyst v$(VERSION)] java - end'
 
 jre: native
@@ -293,6 +372,10 @@ jre: native
 	if [ -f "$(ls jre*.tar.xz)" ]; then rm $(SOURCEDIR)/depends/jre*.tar.xz; fi; \
 	cd $(SOURCEDIR); \
 	bash $(SOURCEDIR)/scripts/build_jre25.sh; \
+	python3 $(SOURCEDIR)/scripts/patch_jre_mirror_runtime.py 17 $(POJAV_JRE17_DIR)/lib/server/libjvm.dylib; \
+	python3 $(SOURCEDIR)/scripts/patch_jre_mirror_runtime.py --check 17 $(POJAV_JRE17_DIR)/lib/server/libjvm.dylib; \
+	python3 $(SOURCEDIR)/scripts/patch_jre_mirror_runtime.py 21 $(POJAV_JRE21_DIR)/lib/server/libjvm.dylib; \
+	python3 $(SOURCEDIR)/scripts/patch_jre_mirror_runtime.py --check 21 $(POJAV_JRE21_DIR)/lib/server/libjvm.dylib; \
 	rm -rf $(SOURCEDIR)/depends/java-{8,17,21}-openjdk/{ASSEMBLY_EXCEPTION,bin,include,jre,legal,LICENSE,man,THIRD_PARTY_README,lib/{ct.sym,jspawnhelper,libjsig.dylib,src.zip,tools.jar}}; \
 	$(call METHOD_DIRCHECK,$(OUTPUTDIR)/java_runtimes); \
 	cp -R $(POJAV_JRE8_DIR) $(OUTPUTDIR)/java_runtimes; \
@@ -328,11 +411,12 @@ $(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/
 assets:
 	echo '[Amethyst v$(VERSION)] assets - start'
 	if [ -d /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform ]; then \
-		mkdir -p $(WORKINGDIR)/AngelAuraAmethyst.app/Base.lproj; \
+		rm -rf $(WORKINGDIR)/compiled-assets; \
+		mkdir -p $(WORKINGDIR)/compiled-assets $(WORKINGDIR)/AngelAuraAmethyst.app/Base.lproj; \
 		xcrun actool $(SOURCEDIR)/Natives/Assets.xcassets \
-			--compile $(SOURCEDIR)/Natives/resources \
-			--platform iphoneos \
-			--minimum-deployment-target 14.0 \
+			--compile $(WORKINGDIR)/compiled-assets \
+			--platform $(ASSET_PLATFORM) \
+			--minimum-deployment-target $(APPLE_DEPLOYMENT_TARGET) \
 			--app-icon AppIcon-Light \
 			--output-partial-info-plist /dev/null || true; \
 	else \
@@ -340,29 +424,40 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg java jre assets
+payload: native java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)
+	rm -rf "$(WORKINGDIR)/AngelAuraAmethyst.app/FrameworksSimulator"
 	cp -R $(SOURCEDIR)/Natives/resources/en.lproj/LaunchScreen.storyboardc $(WORKINGDIR)/AngelAuraAmethyst.app/Base.lproj/ || exit 1
-	cp -R $(SOURCEDIR)/Natives/resources/* $(WORKINGDIR)/AngelAuraAmethyst.app/ || exit 1
+	find "$(SOURCEDIR)/Natives/resources" -mindepth 1 -maxdepth 1 ! -name FrameworksSimulator -exec cp -R {} "$(WORKINGDIR)/AngelAuraAmethyst.app/" \;
+	if [ -d "$(WORKINGDIR)/compiled-assets" ]; then cp -R "$(WORKINGDIR)/compiled-assets/." "$(WORKINGDIR)/AngelAuraAmethyst.app/"; fi
+	if [ '$(PLATFORM)' = '7' ]; then \
+		cp -R "$(SIMULATOR_FRAMEWORK_DIR)/." "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/"; \
+		plutil -replace MinimumOSVersion -string 16.0 "$(WORKINGDIR)/AngelAuraAmethyst.app/Info.plist"; \
+	fi
 	cp $(WORKINGDIR)/*.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/ || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	cp $(SOURCEDIR)/JavaApp/build/*.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo || exit 1
 	cp -R $(SOURCEDIR)/JavaApp/libs/caciocavallo17/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17 || exit 1
 	$(call METHOD_DIRCHECK,$(OUTPUTDIR)/Payload)
+	rm -rf "$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app"
 	cp -R $(WORKINGDIR)/AngelAuraAmethyst.app $(OUTPUTDIR)/Payload
 	if [ '$(SLIMMED_ONLY)' != '1' ]; then \
 		cp -R $(OUTPUTDIR)/java_runtimes $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
 	fi
-	ldid -S $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
-	if [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
+	if [ '$(PLATFORM)' = '7' ]; then \
+		:; \
+	elif [ '$(TROLLSTORE_JIT_ENT)' == '1' ]; then \
+		ldid -S $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
 		ldid -S$(SOURCEDIR)/entitlements.trollstore.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
 	elif [ '$(PLATFORM)' == '6' ]; then \
+		ldid -S $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
 		ldid -S$(SOURCEDIR)/entitlements.codesign.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
 	else \
+		ldid -S $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app; \
 		ldid -S$(SOURCEDIR)/entitlements.sideload.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst; \
 	fi
 	chmod -R 755 $(OUTPUTDIR)/Payload
@@ -373,7 +468,14 @@ payload: native dep_mg java jre assets
 	# committed dylibs were already iOS-tagged — that broke when v19 added
 	# the 3.3.5 lwjgl-stb dylib straight from upstream.
 	$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file)); \
-	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file));
+	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CHANGE_PLAT,$(PLATFORM),$$file)); \
+	if [ '$(PLATFORM)' = '7' ]; then \
+		$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app,codesign --force --sign - --timestamp=none $$file); \
+		find "$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/Frameworks" -type d -name '*.framework' -exec codesign --force --sign - --timestamp=none {} \; ; \
+		codesign --force --sign - --timestamp=none "$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst"; \
+		codesign --force --sign - --timestamp=none "$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app"; \
+		codesign --verify --deep --strict --verbose=2 "$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app"; \
+	fi
 	echo '[Amethyst v$(VERSION)] payload - end'
 
 deploy:
@@ -406,14 +508,14 @@ deploy:
 package: payload
 	echo '[Amethyst v$(VERSION)] package - start'
 	if [ '$(TEAMID)' != '-1' ] && [ '$(SIGNING_TEAMID)' != '-1' ] && [ -f '$(PROVISIONING)' ] && [ '$(DETECTPLAT)' = 'Darwin' ]; then \
-		printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n	<key>application-identifier</key>\n	<string>$(TEAMID).org.angelauramc.amethyst</string>\n	<key>com.apple.developer.team-identifier</key>\n	<string>$(TEAMID)</string>\n	<key>get-task-allow</key>\n	<true/>\n	<key>keychain-access-groups</key>\n	<array>\n	<string>$(TEAMID).*</string>\n	<string>com.apple.token</string>\n	</array>\n</dict>\n</plist>' > entitlements.codesign.xml; \
+		printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n	<key>application-identifier</key>\n	<string>$(TEAMID).org.catsruledogs.amethyst</string>\n	<key>com.apple.developer.team-identifier</key>\n	<string>$(TEAMID)</string>\n	<key>get-task-allow</key>\n	<true/>\n	<key>keychain-access-groups</key>\n	<array>\n	<string>$(TEAMID).*</string>\n	<string>com.apple.token</string>\n	</array>\n</dict>\n</plist>' > entitlements.codesign.xml; \
 		$(MAKE) codesign; \
-		rm -rf entitlements.codesign.xml; \
 	else \
 		echo 'Skipped codesigning. If not intentional, check your variables.'; \
 	fi
 	cd $(OUTPUTDIR); \
 	$(call METHOD_PACKAGE); \
+	rm -f $(SOURCEDIR)/entitlements.codesign.xml; \
 	zip --symlinks -r $(OUTPUTDIR)/java_runtimes.zip java_runtimes; \
 	echo '[Amethyst v$(VERSION)] package - end'
 	
@@ -429,6 +531,7 @@ codesign:
 	cp '$(PROVISIONING)' $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app/embedded.mobileprovision
 	$(call METHOD_MACHO,$(OUTPUTDIR)/Payload/AngelAuraAmethyst.app,$(call METHOD_CODESIGN,$(SIGNING_TEAMID),$$file))
 	$(call METHOD_MACHO,$(OUTPUTDIR)/java_runtimes,$(call METHOD_CODESIGN,$(SIGNING_TEAMID),$$file))
+	codesign -f -s $(SIGNING_TEAMID) --generate-entitlement-der --entitlements entitlements.codesign.xml $(OUTPUTDIR)/Payload/AngelAuraAmethyst.app
 	echo '[Amethyst v$(VERSION)] codesign - end'
 
 clean:

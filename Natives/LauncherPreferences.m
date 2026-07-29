@@ -4,6 +4,7 @@
 #import "PLPreferences.h"
 #import "UIKit+hook.h"
 #import <CoreFoundation/CoreFoundation.h>
+#import <TargetConditionals.h>
 
 static PLPreferences* pref;
 
@@ -137,6 +138,12 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion) {
 
 #pragma mark Renderer
 NSArray* getRendererKeys(BOOL containsDefault) {
+#if TARGET_OS_SIMULATOR
+    NSMutableArray *array = @[
+        @"auto",
+        @ RENDERER_NAME_MTL_ANGLE
+    ].mutableCopy;
+#else
     NSMutableArray *array = @[
         @"auto",
         @ RENDERER_NAME_GL4ES,
@@ -146,6 +153,7 @@ NSArray* getRendererKeys(BOOL containsDefault) {
         @ RENDERER_NAME_VK_ZINK,
         @ RENDERER_NAME_VULKAN
     ].mutableCopy;
+#endif
 
     if (containsDefault) {
         [array insertObject:@"(default)" atIndex:0];
@@ -159,6 +167,12 @@ NSArray* getRendererNames(BOOL containsDefault) {
     if (containsDefault) {
         [array addObject:@"(default)"];
     }
+#if TARGET_OS_SIMULATOR
+    NSString *names[] = {
+        localize(@"preference.title.renderer.debug.auto", nil),
+        localize(@"preference.title.renderer.debug.angle", nil)
+    };
+#else
     NSString *names[] = {
         localize(@"preference.title.renderer.debug.auto", nil),
         localize(@"preference.title.renderer.debug.gl4es", nil),
@@ -168,6 +182,7 @@ NSArray* getRendererNames(BOOL containsDefault) {
         localize(@"preference.title.renderer.debug.zink", nil),
         localize(@"preference.title.renderer.debug.vulkan", nil)
     };
+#endif
     for (int i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
         if (names[i]) {
             [array addObject:names[i]];

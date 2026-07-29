@@ -279,7 +279,7 @@
         if((size.width / 3) > 200) {
             [self.accountButton setAttributedTitle:[[NSAttributedString alloc] initWithString:localize(@"login.option.select", nil)] forState:UIControlStateNormal];
         } else {
-            [self.accountButton setAttributedTitle:(NSAttributedString *)@"" forState:UIControlStateNormal];
+            [self.accountButton setAttributedTitle:[[NSAttributedString alloc] initWithString:@""] forState:UIControlStateNormal];
         }
         [self.accountButton setImage:[UIImage imageNamed:@"DefaultAccount"] forState:UIControlStateNormal];
         [self.accountButton sizeToFit];
@@ -316,7 +316,7 @@
     if((size.width / 3) > 200) {
         [self.accountButton setAttributedTitle:title forState:UIControlStateNormal];
     } else {
-        [self.accountButton setAttributedTitle:(NSAttributedString *)@"" forState:UIControlStateNormal];
+        [self.accountButton setAttributedTitle:[[NSAttributedString alloc] initWithString:@""] forState:UIControlStateNormal];
     }
     
     // TODO: Add caching mechanism for profile pictures

@@ -1,0 +1,65 @@
+From 9ae8b8bba6ea7a6a7db735e56a5bad66cf6260b8 Mon Sep 17 00:00:00 2001
+From: Amethyst Contributors <amethyst@example.invalid>
+Date: Wed, 29 Jul 2026 16:40:37 +0900
+Subject: [PATCH 4/6] Metal: support the separately installed Xcode toolchain
+
+---
+ src/libANGLE/renderer/metal/BUILD.gn          | 9 +++++++--
+ src/libANGLE/renderer/metal/metal_backend.gni | 7 +++++++
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index 96e9ee842..d17968596 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -27,6 +27,11 @@ if (metal_internal_shader_compilation_supported) {
+   _metal_internal_shaders_air_file =
+       "$root_gen_dir/angle/mtl_internal_shaders_autogen.air"
+ 
++  _metal_bin_path = mac_bin_path
++  if (angle_metal_toolchain_bin_path != "") {
++    _metal_bin_path = angle_metal_toolchain_bin_path
++  }
++
+   action("angle_metal_internal_shaders_to_air") {
+     script = "shaders/metal_wrapper.py"
+ 
+@@ -37,7 +42,7 @@ if (metal_internal_shader_compilation_supported) {
+     sources = [ _metal_internal_shaders_metal_source ]
+ 
+     args = [
+-      mac_bin_path + "metal",
++      _metal_bin_path + "metal",
+       "-c",
+       rebase_path(_metal_internal_shaders_metal_source, root_build_dir),
+       "-o",
+@@ -70,7 +75,7 @@ if (metal_internal_shader_compilation_supported) {
+     deps = [ ":angle_metal_internal_shaders_to_air" ]
+ 
+     args = [
+-      mac_bin_path + "metallib",
++      _metal_bin_path + "metallib",
+       rebase_path(_metal_internal_shaders_air_file, root_build_dir),
+       "-o",
+       rebase_path(_metal_internal_shaders_metallib_file, root_build_dir),
+diff --git a/src/libANGLE/renderer/metal/metal_backend.gni b/src/libANGLE/renderer/metal/metal_backend.gni
+index d3a8a1d6e..cdbd9410f 100644
+--- a/src/libANGLE/renderer/metal/metal_backend.gni
++++ b/src/libANGLE/renderer/metal/metal_backend.gni
+@@ -4,6 +4,13 @@
+ 
+ import("../../../../gni/angle.gni")
+ 
++declare_args() {
++  # Xcode 26 and newer can install Metal tools as a separate component. Set
++  # this to the component's bin directory (including the trailing slash) when
++  # XcodeDefault.xctoolchain only contains a dispatch stub.
++  angle_metal_toolchain_bin_path = ""
++}
++
+ metal_backend_sources = [
+   "BufferMtl.h",
+   "BufferMtl.mm",
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,167 @@
+From 3871fde4ac62ff73fe2dc50221652b5d36621c26 Mon Sep 17 00:00:00 2001
+From: Amethyst Contributors <amethyst@example.invalid>
+Date: Wed, 29 Jul 2026 16:40:25 +0900
+Subject: [PATCH 2/6] Metal: translate Desktop GL sampler buffers
+
+---
+ src/compiler/translator/SymbolTable.cpp       |  9 ++-
+ .../translator/msl/ProgramPrelude.cpp         | 17 ++++
+ src/tests/compiler_tests/MSLOutput_test.cpp   | 80 +++++++++++++++++++
+ 3 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/src/compiler/translator/SymbolTable.cpp b/src/compiler/translator/SymbolTable.cpp
+index f1fa54063..f89cfffa5 100644
+--- a/src/compiler/translator/SymbolTable.cpp
++++ b/src/compiler/translator/SymbolTable.cpp
+@@ -469,7 +469,14 @@ const TSymbol *SymbolRule::get(ShShaderSpec shaderSpec,
+                                const ShBuiltInResources &resources,
+                                const TSymbolTableBase &symbolTable) const
+ {
+-    if (IsDesktopGLSpec(shaderSpec) != (mIsDesktop == 1))
++    // Backend-only built-ins are generated in the ESSL table, but backend tree
++    // transformations are also used when translating desktop GLSL.  Keep these
++    // symbols hidden from user shaders while allowing an explicit internal
++    // lookup from either frontend.
++    const bool isInternalBackendBuiltIn =
++        shaderVersion == kESSLInternalBackendBuiltIns &&
++        mVersion == kESSLInternalBackendBuiltIns;
++    if (!isInternalBackendBuiltIn && IsDesktopGLSpec(shaderSpec) != (mIsDesktop == 1))
+         return nullptr;
+ 
+     if (mVersion == kESSL1Only && shaderVersion != static_cast<int>(kESSL1Only))
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 67f7cb198..3d55e7cbc 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -179,6 +179,7 @@ class ProgramPrelude : public TIntermTraverser
+     void texelFetch_2D();
+     void texelFetch_3D();
+     void texelFetch_2DArray();
++    void texelFetch_Buffer();
+     void texelFetchOffset_2D();
+     void texelFetchOffset_3D();
+     void texelFetchOffset_2DArray();
+@@ -1370,6 +1371,18 @@ ANGLE_ALWAYS_INLINE auto ANGLE_texelFetch(
+ )",
+                         textureEnv())
+ 
++PROGRAM_PRELUDE_DECLARE(texelFetch_Buffer,
++                        R"(
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_texelFetch(
++    thread ANGLE_TextureEnv<metal::texture_buffer<T>> &env,
++    int const coord)
++{
++    return env.texture->read(uint32_t(coord));
++}
++)",
++                        textureEnv())
++
+ PROGRAM_PRELUDE_DECLARE(texelFetchOffset_2D,
+                         R"(
+ template <typename T>
+@@ -2984,6 +2997,10 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+             case EbtISampler2DArray:
+             case EbtUSampler2DArray:
+                 return pp.texelFetch_2DArray();
++            case EbtSamplerBuffer:
++            case EbtISamplerBuffer:
++            case EbtUSamplerBuffer:
++                return pp.texelFetch_Buffer();
+             default:
+                 UNREACHABLE();
+         }
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index f512f71fb..91ffd7fd0 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -38,6 +38,86 @@ class MSLOutputTest : public MatchOutputCodeTest
+     }
+ };
+ 
++// Regression test for desktop GLSL sampler buffers. The Metal translator used
++// to emit calls to ANGLE_texelFetch without emitting the matching texture_buffer
++// overload, which made the generated MSL fail during program linking.
++TEST(MSLOutputDesktopGLTest, TexelFetchFromIntegerSamplerBufferEmitsHelper)
++{
++    constexpr char kShader[] = R"(#version 330
++        uniform isamplerBuffer cloudFaces;
++        flat out int face;
++        void main()
++        {
++            face = texelFetch(cloudFaces, gl_VertexID).r;
++            gl_Position = vec4(0.0);
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions       = {};
++    compileOptions.rescopeGlobalVariables = true;
++    compileOptions.validateAST            = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_VERTEX_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT, kShader,
++                                  &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_NE(translatedCode.find("ANGLE_TextureEnv<metal::texture_buffer<int>>"),
++              std::string::npos);
++    EXPECT_NE(translatedCode.find("ANGLE_TextureEnv<metal::texture_buffer<T>> &env"),
++              std::string::npos);
++    EXPECT_NE(translatedCode.find("env.texture->read(uint32_t(coord))"), std::string::npos);
++}
++
++// Regression test for desktop GLSL fragment shaders translated to Metal with
++// shareable shaders enabled. The MSL lowering passes use internal backend
++// built-ins for alpha-to-coverage; those symbols must be available to both
++// ESSL and desktop GLSL specifications.
++TEST(MSLOutputDesktopGLTest, ShareableFragmentShaderFindsInternalMetalBuiltIns)
++{
++    constexpr char kShader[] = R"(#version 330
++        layout(std140) uniform DynamicTransforms
++        {
++            mat4 ModelViewMat;
++            vec4 ColorModulator;
++            vec3 ModelOffset;
++            mat4 TextureMat;
++        };
++
++        in vec4 vertexColor;
++        out vec4 fragColor;
++
++        void main()
++        {
++            vec4 color = vertexColor;
++            if (color.a == 0.0)
++            {
++                discard;
++            }
++            fragColor = color * ColorModulator;
++        })";
++
++    ShBuiltInResources resources;
++    InitBuiltInResources(&resources);
++
++    ShCompileOptions compileOptions                  = {};
++    compileOptions.rescopeGlobalVariables            = true;
++    compileOptions.validateAST                       = true;
++    compileOptions.metal.generateShareableShaders    = true;
++
++    std::string translatedCode;
++    std::string infoLog;
++    ASSERT_TRUE(compileTestShader(GL_FRAGMENT_SHADER, SH_GL_CORE_SPEC, SH_MSL_METAL_OUTPUT,
++                                  kShader, &resources, compileOptions, &translatedCode, &infoLog))
++        << infoLog;
++
++    EXPECT_NE(translatedCode.find("metal::saturate"), std::string::npos);
++    EXPECT_NE(translatedCode.find("metal::get_num_samples"), std::string::npos);
++}
++
+ // Test that having dynamic indexing of a vector inside the right hand side of logical or doesn't
+ // trigger asserts in MSL output.
+ TEST_F(MSLOutputTest, DynamicIndexingOfVectorOnRightSideOfLogicalOr)
+-- 
+2.50.1 (Apple Git-155)
+

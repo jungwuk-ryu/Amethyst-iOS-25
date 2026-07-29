@@ -1,0 +1,62 @@
+From fe67efbd2bc56584bab62a32dc7af6980adb8218 Mon Sep 17 00:00:00 2001
+From: Amethyst Contributors <amethyst@example.invalid>
+Date: Wed, 29 Jul 2026 16:40:19 +0900
+Subject: [PATCH 1/6] Metal: enable the Desktop GL frontend
+
+---
+ src/libANGLE/renderer/metal/DisplayMtl.mm | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 14219b55b..91eb3cff1 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -445,7 +445,7 @@ bool IsMetalDisplayAvailable()
+ 
+ Optional<gl::Version> DisplayMtl::getMaxSupportedDesktopVersion() const
+ {
+-    return Optional<gl::Version>::Invalid();
++    return gl::Version(3, 3);
+ }
+ 
+ EGLSyncImpl *DisplayMtl::createSync()
+@@ -576,7 +576,8 @@ bool IsMetalDisplayAvailable()
+ 
+     config.renderTargetFormat = GL_RGBA8;
+ 
+-    config.conformant     = EGL_OPENGL_ES2_BIT | (supportsES3 ? EGL_OPENGL_ES3_BIT_KHR : 0);
++    config.conformant =
++        EGL_OPENGL_ES2_BIT | (supportsES3 ? EGL_OPENGL_ES3_BIT_KHR : 0) | EGL_OPENGL_BIT;
+     config.renderableType = config.conformant;
+ 
+     config.matchNativePixmap = EGL_NONE;
+@@ -837,6 +838,7 @@ bool IsMetalDisplayAvailable()
+     // Uniforms are implemented using a uniform buffer, so the max number of uniforms we can
+     // support is the max buffer range divided by the size of a single uniform (4X float).
+     mNativeCaps.maxVertexUniformVectors                              = maxDefaultUniformVectors;
++    mNativeCaps.maxUniformLocations                                  = maxDefaultUniformVectors;
+     mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Vertex]   = maxDefaultUniformComponents;
+     mNativeCaps.maxFragmentUniformVectors                            = maxDefaultUniformVectors;
+     mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Fragment] = maxDefaultUniformComponents;
+@@ -888,7 +890,8 @@ bool IsMetalDisplayAvailable()
+         mNativeCaps.maxCombinedShaderUniformComponents[shaderType] = maxCombinedUniformComponents;
+     }
+ 
+-    mNativeCaps.maxCombinedShaderOutputResources = 0;
++    mNativeCaps.maxCombinedShaderOutputResources =
++        mtl::kMaxShaderBuffers + mtl::kMaxShaderSamplers;
+ 
+     mNativeCaps.maxTransformFeedbackInterleavedComponents =
+         gl::IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS;
+@@ -935,6 +938,8 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.stencilTexturingANGLE         = true;
+     mNativeExtensions.copyTextureCHROMIUM           = true;
+     mNativeExtensions.copyCompressedTextureCHROMIUM = false;
++    mNativeExtensions.getImageANGLE                 = true;
++    mNativeExtensions.shaderNonConstantGlobalInitializersEXT = true;
+     mNativeExtensions.textureMirrorClampToEdgeEXT   = true;
+     mNativeExtensions.depthClampEXT                 = true;
+ 
+-- 
+2.50.1 (Apple Git-155)
+
