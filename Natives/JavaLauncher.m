@@ -201,6 +201,61 @@ static NSString *BundledDebugJITRuntime(int minimumVersion) {
     return nil;
 }
 
+#if TARGET_OS_SIMULATOR
+static NSString *BundledSimulatorJNADirectory(id launchTarget) {
+    if (![launchTarget isKindOfClass:NSDictionary.class]) {
+        return nil;
+    }
+
+    NSArray *libraries = launchTarget[@"libraries"];
+    if (![libraries isKindOfClass:NSArray.class]) {
+        return nil;
+    }
+
+    for (id library in libraries) {
+        if (![library isKindOfClass:NSDictionary.class]) continue;
+        NSString *name = library[@"name"];
+        if (![name isKindOfClass:NSString.class] ||
+            ![name hasPrefix:@"net.java.dev.jna:jna:"]) {
+            continue;
+        }
+
+        NSArray<NSString *> *coordinates =
+            [name componentsSeparatedByString:@":"];
+        if (coordinates.count < 3) return nil;
+
+        NSArray<NSString *> *version =
+            [coordinates[2] componentsSeparatedByString:@"."];
+        if (version.count < 2) return nil;
+
+        NSString *abiVersion =
+            [NSString stringWithFormat:@"%@.%@", version[0], version[1]];
+        if (![@[@"5.13", @"5.17"] containsObject:abiVersion]) {
+            NSLog(@"[JavaLauncher] No signed Simulator JNA native for %@",
+                  coordinates[2]);
+            return nil;
+        }
+
+        NSString *directory = [NSString stringWithFormat:
+            @"%@/Frameworks/jna/%@", NSBundle.mainBundle.bundlePath,
+            abiVersion];
+        NSString *nativeLibrary =
+            [directory stringByAppendingPathComponent:@"libjnidispatch.dylib"];
+        if (![fm fileExistsAtPath:nativeLibrary]) {
+            NSLog(@"[JavaLauncher] Signed Simulator JNA native is missing: %@",
+                  nativeLibrary);
+            return nil;
+        }
+
+        NSLog(@"[JavaLauncher] Using signed Simulator JNA %@ from %@",
+              coordinates[2], directory);
+        return directory;
+    }
+
+    return nil;
+}
+#endif
+
 int launchJVM(NSString *username, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
     const int requiredJavaVersion = minVersion;
@@ -379,6 +434,21 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
     margv[++margc] = "-Xms128M";
     margv[++margc] = [NSString stringWithFormat:@"-Xmx%dM", allocmem].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Djava.library.path=%@/Frameworks", NSBundle.mainBundle.bundlePath].UTF8String;
+#if TARGET_OS_SIMULATOR
+    // Runtime platform rewriting invalidates the signature embedded in JNA's
+    // macOS native. A normal Simulator launch then dies with CODESIGNING /
+    // Invalid Page while a debugger-attached launch misleadingly succeeds.
+    // Prefer the matching, pre-converted and signed Simulator native and
+    // prevent JNA from falling back to extracting the invalid binary.
+    NSString *simulatorJNADirectory =
+        BundledSimulatorJNADirectory(launchTarget);
+    if (simulatorJNADirectory) {
+        margv[++margc] = [NSString stringWithFormat:
+            @"-Djna.boot.library.path=%@", simulatorJNADirectory].UTF8String;
+        margv[++margc] = "-Djna.nosys=true";
+        margv[++margc] = "-Djna.nounpack=true";
+    }
+#endif
     margv[++margc] = [NSString stringWithFormat:@"-Duser.dir=%@", gameDir].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Duser.home=%s", getenv("POJAV_HOME")].UTF8String;
     margv[++margc] = [NSString stringWithFormat:@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name].UTF8String;

@@ -340,11 +340,17 @@ simulator_frameworks:
 	echo '[Amethyst v$(VERSION)] simulator_frameworks - start'
 	test -f "$(SIMULATOR_FRAMEWORK_SOURCE)/libEGL.framework/libEGL"
 	test -f "$(SIMULATOR_FRAMEWORK_SOURCE)/libGLESv2.framework/libGLESv2"
+	test -s "$(SIMULATOR_FRAMEWORK_SOURCE)/jna/LICENSE"
+	test -s "$(SIMULATOR_FRAMEWORK_SOURCE)/jna/AL2.0"
+	cd "$(SIMULATOR_FRAMEWORK_SOURCE)" && shasum -a 256 --check JNA_SHA256SUMS
 	rm -rf "$(SIMULATOR_FRAMEWORK_DIR)"
 	mkdir -p "$(SIMULATOR_FRAMEWORK_DIR)"
 	cp -R "$(SOURCEDIR)/Natives/resources/Frameworks/." "$(SIMULATOR_FRAMEWORK_DIR)/"
 	cp -R "$(SIMULATOR_FRAMEWORK_SOURCE)/libEGL.framework" "$(SIMULATOR_FRAMEWORK_DIR)/"
 	cp -R "$(SIMULATOR_FRAMEWORK_SOURCE)/libGLESv2.framework" "$(SIMULATOR_FRAMEWORK_DIR)/"
+	cp -R "$(SIMULATOR_FRAMEWORK_SOURCE)/jna" "$(SIMULATOR_FRAMEWORK_DIR)/"
+	cp "$(SIMULATOR_FRAMEWORK_SOURCE)/JNA_SOURCE.md" "$(SIMULATOR_FRAMEWORK_DIR)/"
+	cp "$(SIMULATOR_FRAMEWORK_SOURCE)/JNA_SHA256SUMS" "$(SIMULATOR_FRAMEWORK_DIR)/"
 	$(call METHOD_MACHO,$(SIMULATOR_FRAMEWORK_DIR),$(call METHOD_CHANGE_PLAT,7,$$file))
 	find "$(SIMULATOR_FRAMEWORK_DIR)" -name Info.plist -print0 | while IFS= read -r -d '' plist; do \
 		plutil -replace CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$$plist" 2>/dev/null || \

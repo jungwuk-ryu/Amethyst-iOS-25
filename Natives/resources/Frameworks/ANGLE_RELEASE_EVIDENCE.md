@@ -53,10 +53,18 @@ PR #45 launcher plus the final patched Simulator ANGLE frameworks
   Persisted renderer set to libmobileglues.dylib: Simulator launcher logged
   the unsupported selection, normalized it to ANGLE, and entered the same
   Pre-Release 6 world.
+  Final packaged, debugger-free path: the Simulator-only launcher toolbar
+  exposed the real Play action; JNA 5.17 loaded from the matching pre-converted
+  and signed bundle native without extracting a mutable Mach-O. Pre-Release 5
+  entered the world and remained active through the timed smoke run.
+  Pre-Release 6 entered the same world, accepted live look input, and remained
+  active for 3 minutes 17 seconds. Neither run added a crash report or logged
+  a code-signing, SIGSEGV, Metal assertion, or JNA load failure.
 ```
 
 The user separately validated the MobileGlues PR IPA on physical devices
 running iOS 26 and iOS 27 beta. That does not count as direct-ANGLE device
 validation. Direct ANGLE on a physical device remains required before the
 device `auto` renderer can prefer ANGLE over the retained MobileGlues
-fallback.
+fallback. The installed Xcode provides iOS 26.5 and 26.4 Simulator runtimes;
+an iOS 27 beta Simulator runtime was not available for this validation.

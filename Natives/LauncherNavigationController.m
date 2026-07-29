@@ -19,6 +19,7 @@
 #import "utils.h"
 
 #import <objc/runtime.h>
+#import <TargetConditionals.h>
 #include <sys/time.h>
 
 #define AUTORESIZE_MASKS UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin
@@ -520,6 +521,39 @@ static void *ProgressObserverContext = &ProgressObserverContext;
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+#if TARGET_OS_SIMULATOR
+    // On recent Simulator runtimes UINavigationController can initially expose
+    // its toolbar with the navigation view's full height. The legacy custom
+    // controls then inherit that height and cover the launcher, leaving the
+    // Play action unreachable. Restore the 100-point toolbar geometry that
+    // this controller was written against after UIKit completes its layout.
+    if (!self.globalToolbarItems && self.buttonInstall) {
+        UIToolbar *targetToolbar = self.toolbar;
+        CGFloat toolbarWidth = CGRectGetWidth(self.view.bounds);
+        CGFloat toolbarHeight = 100.0;
+        if (targetToolbar.superview == nil) {
+            // iOS 26.5 Simulator can leave the lazily-created toolbar
+            // detached even though toolbarHidden is NO.
+            [self.view addSubview:targetToolbar];
+        }
+        targetToolbar.frame = CGRectMake(
+            CGRectGetMinX(self.view.bounds),
+            CGRectGetMaxY(self.view.bounds) - toolbarHeight,
+            toolbarWidth,
+            toolbarHeight);
+        self.versionTextField.frame =
+            CGRectMake(4, 4, toolbarWidth * 0.8 - 8, toolbarHeight - 8);
+        self.buttonInstall.frame =
+            CGRectMake(toolbarWidth * 0.8, 4, toolbarWidth * 0.2,
+                       toolbarHeight - 8);
+        self.progressViewMain.frame = CGRectMake(0, 0, toolbarWidth, 0);
+        self.progressText.frame = self.versionTextField.frame;
+        self.versionTextField.rightView.frame = CGRectMake(
+            0, 0, self.versionTextField.frame.size.height * 0.9,
+            self.versionTextField.frame.size.height * 0.9);
+        [self.view bringSubviewToFront:targetToolbar];
+    }
+#endif
     [sidebarViewController updateAccountInfo];
     if (self.globalToolbarItems) {
         if (!self.viewControllers.firstObject.toolbarItems) {
